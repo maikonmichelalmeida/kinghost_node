@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-18-01";
+const DEPLOY_CHECK = "node-2026-06-18-02";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
