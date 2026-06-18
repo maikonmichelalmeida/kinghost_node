@@ -7,6 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
+const DEPLOY_CHECK = "node-2026-06-18-01";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -121,6 +122,11 @@ async function start() {
 async function handleApi(request, response, apiPath) {
   if (request.method === "OPTIONS") {
     sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (apiPath === "/api/health" && request.method === "GET") {
+    sendJson(response, 200, { ok: true, deployCheck: DEPLOY_CHECK });
     return;
   }
 
