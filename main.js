@@ -141,6 +141,7 @@ async function handleApi(request, response, apiPath) {
   }
 
   const publicLessonIdMatch = apiPath.match(/^\/api\/public\/lessons\/(\d+)$/);
+  const publicLeituraIdMatch = apiPath.match(/^\/api\/public\/leitura\/(\d+)$/);
 
   if (apiPath === "/api/public/lessons" && request.method === "GET") {
     const connection = await openDb();
@@ -165,6 +166,51 @@ async function handleApi(request, response, apiPath) {
       return;
     }
     sendJson(response, 200, rows[0]);
+    return;
+  }
+
+  if (apiPath === "/api/public/leituras" && request.method === "GET") {
+    const connection = await openDb();
+    const [rows] = await connection.query(
+      "SELECT id, titulo FROM leitura ORDER BY id DESC"
+    );
+    await connection.end();
+    sendJson(response, 200, rows);
+    return;
+  }
+
+  if ((apiPath === "/api/public/leitura" || publicLeituraIdMatch) && request.method === "GET") {
+    const requestUrl = new URL(request.url, "http://localhost");
+    const id = publicLeituraIdMatch
+      ? Number(publicLeituraIdMatch[1])
+      : Number(requestUrl.searchParams.get("id") || 0);
+    const titulo = String(requestUrl.searchParams.get("titulo") || "").trim();
+    const connection = await openDb();
+    let rows = [];
+
+    if (id > 0) {
+      [rows] = await connection.execute(
+        "SELECT id, titulo, json_content FROM leitura WHERE id = ? LIMIT 1",
+        [id]
+      );
+    } else if (titulo) {
+      [rows] = await connection.execute(
+        "SELECT id, titulo, json_content FROM leitura WHERE titulo = ? LIMIT 1",
+        [titulo]
+      );
+    } else {
+      [rows] = await connection.query(
+        "SELECT id, titulo, json_content FROM leitura ORDER BY id DESC LIMIT 1"
+      );
+    }
+
+    await connection.end();
+    if (!rows.length) {
+      sendJson(response, 404, { error: "Leitura nao encontrada." });
+      return;
+    }
+
+    sendJson(response, 200, formatLeituraRow(rows[0]));
     return;
   }
 
@@ -400,6 +446,13 @@ async function ensureTable() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
   `);
+  await connection.execute(`
+    CREATE TABLE IF NOT EXISTS leitura (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      titulo VARCHAR(255) NOT NULL,
+      json_content LONGTEXT NOT NULL
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+  `);
   await connection.end();
 }
 
@@ -448,6 +501,22 @@ function extractLessonMetadata(jsonContent) {
 function extractStringField(text, key) {
   const match = text.match(new RegExp(`"${key}"\\s*:\\s*"([^"\\r\\n]*)"`, "i"));
   return match ? unescapeLooseString(match[1].trim()) : "";
+}
+
+function formatLeituraRow(row) {
+  let content = null;
+  try {
+    content = JSON.parse(stripBom(String(row.json_content || "").trim()));
+  } catch {
+    content = null;
+  }
+
+  return {
+    id: row.id,
+    titulo: row.titulo,
+    json_content: row.json_content,
+    content
+  };
 }
 
 function createToken() {
