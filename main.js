@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-18-03";
+const DEPLOY_CHECK = "node-2026-06-21-user-login-01";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -136,7 +136,62 @@ async function handleApi(request, response, apiPath) {
       sendJson(response, 401, { error: "Chave invalida." });
       return;
     }
-    sendJson(response, 200, { token: createToken() });
+    sendJson(response, 200, { token: createFactoryToken() });
+    return;
+  }
+
+  if (apiPath === "/api/user/login" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    const nick = String(body.nick || "").trim();
+    const password = String(body.password || "");
+    if (!nick || !password) {
+      sendJson(response, 400, { error: "Informe usuario e senha." });
+      return;
+    }
+
+    const connection = await openDb();
+    const [rows] = await connection.execute(
+      "SELECT id, nick, senha FROM usuario WHERE nick = ? LIMIT 1",
+      [nick]
+    );
+    await connection.end();
+
+    const user = rows[0];
+    if (!user || !safeTextEqual(password, user.senha)) {
+      sendJson(response, 401, { error: "Usuario ou senha invalidos." });
+      return;
+    }
+
+    sendJson(response, 200, {
+      token: createUserToken(user),
+      user: { id: user.id, nick: user.nick }
+    });
+    return;
+  }
+
+  if (apiPath === "/api/user/session" && request.method === "GET") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+
+    const connection = await openDb();
+    const [rows] = await connection.execute(
+      "SELECT id, nick FROM usuario WHERE id = ? LIMIT 1",
+      [userToken.userId]
+    );
+    await connection.end();
+    if (!rows.length) {
+      sendJson(response, 401, { error: "Usuario nao encontrado." });
+      return;
+    }
+
+    sendJson(response, 200, {
+      ok: true,
+      exp: userToken.exp,
+      user: rows[0]
+    });
     return;
   }
 
@@ -307,6 +362,8 @@ function getApiPath(pathname) {
   if (
     pathname === "/login" ||
     pathname === "/session" ||
+    pathname === "/user/login" ||
+    pathname === "/user/session" ||
     pathname === "/lessons" ||
     pathname.startsWith("/lessons/")
   ) {
@@ -519,9 +576,20 @@ function formatLeituraRow(row) {
   };
 }
 
-function createToken() {
+function createFactoryToken() {
   const payload = {
     sub: "factory",
+    exp: Date.now() + TOKEN_TTL_MS,
+    nonce: crypto.randomBytes(12).toString("hex")
+  };
+  return encryptToken(JSON.stringify(payload));
+}
+
+function createUserToken(user) {
+  const payload = {
+    sub: "user",
+    userId: Number(user.id),
+    nick: String(user.nick),
     exp: Date.now() + TOKEN_TTL_MS,
     nonce: crypto.randomBytes(12).toString("hex")
   };
@@ -544,6 +612,35 @@ function readAuthToken(request) {
   } catch {
     return null;
   }
+}
+
+function readUserAuthToken(request) {
+  const header = request.headers.authorization || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(decryptToken(match[1]));
+    if (
+      !payload ||
+      payload.sub !== "user" ||
+      !Number.isInteger(Number(payload.userId)) ||
+      Number(payload.exp) < Date.now()
+    ) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function safeTextEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left), "utf8");
+  const rightBuffer = Buffer.from(String(right), "utf8");
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function encryptToken(text) {
