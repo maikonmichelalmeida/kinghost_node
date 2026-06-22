@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-vocabulary-processing-01";
+const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-01";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -300,6 +300,10 @@ async function handleApi(request, response, apiPath) {
           updated_at = CURRENT_TIMESTAMP`,
         [userToken.userId, vocabulary.id]
       );
+      await connection.execute(
+        "UPDATE usuario SET contexto_vocabulario_json = NULL, data_ultimo_treino = '2000-01-01 00:00:00' WHERE id = ?",
+        [userToken.userId]
+      );
 
       const [studyQueue] = await connection.execute(
         `SELECT
@@ -420,8 +424,10 @@ async function handleApi(request, response, apiPath) {
     return;
   }
 
-  const tokenPayload = readAuthToken(request);
-  if (!tokenPayload) {
+  const isUserTrainingRoute = apiPath === "/api/user/vocabulary-training" ||
+    apiPath === "/api/user/vocabulary-training/answer";
+  const tokenPayload = isUserTrainingRoute ? null : readAuthToken(request);
+  if (!isUserTrainingRoute && !tokenPayload) {
     sendJson(response, 401, { error: "Login necessario." });
     return;
   }
@@ -445,6 +451,63 @@ async function handleApi(request, response, apiPath) {
       }))
     });
     return;
+  }
+
+  if (apiPath === "/api/user/vocabulary-training" && request.method === "GET") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+
+    const connection = await openDb();
+    try {
+      await connection.beginTransaction();
+      const training = await getOrBuildVocabularyTraining(connection, userToken.userId);
+      await connection.commit();
+      sendJson(response, 200, { training: publicVocabularyTraining(training) });
+      return;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      await connection.end();
+    }
+  }
+
+  if (apiPath === "/api/user/vocabulary-training/answer" && request.method === "POST") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+
+    const body = await readJsonBody(request);
+    const exerciseId = String(body.exerciseId || "").trim();
+    const answer = String(body.answer || "").trim();
+    if (!exerciseId || !answer) {
+      sendJson(response, 400, { error: "Informe o exercicio e a resposta." });
+      return;
+    }
+
+    const connection = await openDb();
+    try {
+      await connection.beginTransaction();
+      const result = await answerVocabularyExercise(connection, userToken.userId, exerciseId, answer);
+      await connection.commit();
+      sendJson(response, 200, result);
+      return;
+    } catch (error) {
+      await connection.rollback();
+      const status = Number(error.statusCode || 500);
+      if (status < 500) {
+        sendJson(response, status, { error: error.message });
+        return;
+      }
+      throw error;
+    } finally {
+      await connection.end();
+    }
   }
 
   if (apiPath === "/api/vocabulary/process" && request.method === "POST") {
@@ -559,6 +622,8 @@ function getApiPath(pathname) {
     pathname === "/user/session" ||
     pathname === "/user/context" ||
     pathname === "/user/vocabulary" ||
+    pathname === "/user/vocabulary-training" ||
+    pathname === "/user/vocabulary-training/answer" ||
     pathname === "/vocabulary/pending" ||
     pathname === "/vocabulary/process" ||
     pathname === "/lessons" ||
@@ -720,6 +785,21 @@ async function ensureTable() {
         FOREIGN KEY (primitivo_id) REFERENCES vocabulario(id)
         ON DELETE CASCADE ON UPDATE CASCADE
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+  `);
+  await connection.execute(`
+    ALTER TABLE usuario
+      ADD COLUMN IF NOT EXISTS palavras_por_dia SMALLINT UNSIGNED NOT NULL DEFAULT 5,
+      ADD COLUMN IF NOT EXISTS data_ultimo_treino DATETIME NOT NULL DEFAULT '2000-01-01 00:00:00',
+      ADD COLUMN IF NOT EXISTS contexto_vocabulario_json LONGTEXT NULL
+  `);
+  await connection.execute(`
+    ALTER TABLE exemplo
+      ADD COLUMN IF NOT EXISTS resposta LONGTEXT NULL AFTER traducao
+  `);
+  await connection.execute(`
+    ALTER TABLE estuda_palavra
+      MODIFY COLUMN score SMALLINT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS ultima_revisao DATETIME NULL AFTER score
   `);
   await connection.end();
 }
@@ -892,11 +972,8 @@ async function processVocabularyPayload(connection, payload) {
     categories.set(writing, current);
   };
 
-  const derivativeItems = Array.isArray(payload.derivados) ? payload.derivados : [];
-  derivativeItems.forEach((item, index) => {
-    const primitive = normalizeVocabularyWriting(item?.primitivo);
-    const derived = normalizeVocabularyWriting(item?.derivado);
-    const label = derived || `derivados[${index}]`;
+  const derivativeMap = new Map();
+  const addDerivative = (primitive, derived, label) => {
     registerCategory(derived, "derivada");
     if (!primitive || !derived) {
       errors.push({ writing: label, message: "Informe primitivo e derivado." });
@@ -906,7 +983,20 @@ async function processVocabularyPayload(connection, payload) {
       errors.push({ writing: label, message: "Primitivo e derivado nao podem ser iguais." });
       return;
     }
-    derivatives.push({ primitive, derived });
+    const previous = derivativeMap.get(derived);
+    if (previous && previous !== primitive) {
+      errors.push({ writing: derived, message: `A derivada aponta para dois primitivos: ${previous} e ${primitive}.` });
+      return;
+    }
+    derivativeMap.set(derived, primitive);
+  };
+
+  const derivativeItems = Array.isArray(payload.derivados) ? payload.derivados : [];
+  derivativeItems.forEach((item, index) => {
+    const primitive = normalizeVocabularyWriting(item?.primitivo);
+    const derived = normalizeVocabularyWriting(item?.derivado);
+    const label = derived || `derivados[${index}]`;
+    addDerivative(primitive, derived, label);
   });
 
   const invalidItems = Array.isArray(payload.invalidas) ? payload.invalidas : [];
@@ -932,8 +1022,15 @@ async function processVocabularyPayload(connection, payload) {
     const examples = Array.isArray(details?.frases) ? details.frases : [];
     const invalidExampleIndex = examples.findIndex((item) =>
       !item || typeof item.ingles !== "string" || !item.ingles.trim() ||
-      typeof item.traducao !== "string" || !item.traducao.trim()
+      typeof item.traducao !== "string" || !item.traducao.trim() ||
+      typeof item.resposta !== "string" || !item.resposta.trim()
     );
+
+    const nestedDerivatives = Array.isArray(details?.derivadas) ? details.derivadas : [];
+    nestedDerivatives.forEach((value, index) => {
+      const derived = normalizeVocabularyWriting(value);
+      addDerivative(writing, derived, `${writing}.derivadas[${index}]`);
+    });
 
     if (!writing) {
       errors.push({ writing: rawWriting || "palavra sem nome", message: "Nome da palavra vazio." });
@@ -948,7 +1045,7 @@ async function processVocabularyPayload(connection, payload) {
       return;
     }
     if (invalidExampleIndex !== -1) {
-      errors.push({ writing, message: `Exemplo ${invalidExampleIndex + 1} sem ingles ou traducao.` });
+      errors.push({ writing, message: `Exemplo ${invalidExampleIndex + 1} sem ingles, traducao ou resposta.` });
       return;
     }
 
@@ -957,9 +1054,14 @@ async function processVocabularyPayload(connection, payload) {
       meaning,
       examples: examples.map((item) => ({
         text: item.ingles.trim(),
-        translation: item.traducao.trim()
+        translation: item.traducao.trim(),
+        answer: item.resposta.trim()
       }))
     });
+  });
+
+  derivativeMap.forEach((primitive, derived) => {
+    derivatives.push({ primitive, derived });
   });
 
   const conflicts = new Set();
@@ -1100,10 +1202,18 @@ async function processValidVocabulary(connection, item) {
   for (let index = 0; index < item.examples.length; index += 1) {
     const example = item.examples[index];
     await connection.execute(
-      "INSERT INTO exemplo (vocabulario_id, ordem, texto, traducao) VALUES (?, ?, ?, ?)",
-      [vocabulary.id, index + 1, example.text, example.translation]
+      "INSERT INTO exemplo (vocabulario_id, ordem, texto, traducao, resposta) VALUES (?, ?, ?, ?, ?)",
+      [vocabulary.id, index + 1, example.text, example.translation, example.answer]
     );
   }
+  await connection.execute(
+    `UPDATE usuario u
+    INNER JOIN estuda_palavra ep ON ep.usuario_id = u.id
+    SET u.contexto_vocabulario_json = NULL,
+      u.data_ultimo_treino = '2000-01-01 00:00:00'
+    WHERE ep.vocabulario_id = ?`,
+    [vocabulary.id]
+  );
   await connection.execute("DELETE FROM fila_vocabulario WHERE escrita = ?", [item.writing]);
   return "";
 }
@@ -1125,6 +1235,350 @@ async function readPendingVocabulary(connection) {
     writing: item.escrita,
     createdAt: item.created_at
   }));
+}
+
+const VOCABULARY_TRAINING_VERSION = 1;
+const VOCABULARY_TRAINING_INTERVAL_MS = 23 * 60 * 60 * 1000;
+const LEVEL_RULES = [
+  { waitMs: 0, exampleCount: 10, maxDelta: 10 },
+  { waitMs: 23 * 60 * 60 * 1000, exampleCount: 7, maxDelta: 20 },
+  { waitMs: 7 * 24 * 60 * 60 * 1000, exampleCount: 5, maxDelta: 30 },
+  { waitMs: 25 * 24 * 60 * 60 * 1000, exampleCount: 4, maxDelta: 40 }
+];
+
+async function getOrBuildVocabularyTraining(connection, userId) {
+  const [userRows] = await connection.execute(
+    `SELECT id, palavras_por_dia, data_ultimo_treino, contexto_vocabulario_json
+    FROM usuario WHERE id = ? LIMIT 1 FOR UPDATE`,
+    [userId]
+  );
+  if (!userRows.length) {
+    const error = new Error("Usuario nao encontrado.");
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const user = userRows[0];
+  const saved = parseUserContext(user.contexto_vocabulario_json);
+  const lastBuild = new Date(user.data_ultimo_treino || 0).getTime();
+  const canBuildAgain = !Number.isFinite(lastBuild) || Date.now() - lastBuild >= VOCABULARY_TRAINING_INTERVAL_MS;
+  if (saved?.version === VOCABULARY_TRAINING_VERSION && saved.status === "active") {
+    return saved;
+  }
+  if (saved?.version === VOCABULARY_TRAINING_VERSION && saved.status !== "empty" && !canBuildAgain) {
+    return saved;
+  }
+
+  const training = await buildVocabularyTraining(connection, userId, Math.max(1, Number(user.palavras_por_dia) || 5));
+  await saveVocabularyTraining(connection, userId, training);
+  await connection.execute(
+    "UPDATE usuario SET data_ultimo_treino = CURRENT_TIMESTAMP WHERE id = ?",
+    [userId]
+  );
+  return training;
+}
+
+async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
+  const now = new Date();
+  const [studyRows] = await connection.execute(
+    `SELECT ep.vocabulario_id, ep.nivel, ep.score, ep.created_at, ep.ultima_revisao,
+      v.escrita, v.significado
+    FROM estuda_palavra ep
+    INNER JOIN vocabulario v ON v.id = ep.vocabulario_id
+    WHERE ep.usuario_id = ? AND v.significado IS NOT NULL
+    ORDER BY ep.nivel ASC, ep.score ASC, COALESCE(ep.ultima_revisao, ep.created_at) ASC, ep.vocabulario_id ASC
+    FOR UPDATE`,
+    [userId]
+  );
+
+  for (const word of studyRows) {
+    if (Number(word.score) < 0) {
+      const nextLevel = Math.max(0, Number(word.nivel) - 1);
+      const nextScore = nextLevel === Number(word.nivel) ? 0 : Math.max(0, Number(word.score) + 80);
+      word.nivel = nextLevel;
+      word.score = nextScore;
+      await connection.execute(
+        "UPDATE estuda_palavra SET nivel = ?, score = ? WHERE usuario_id = ? AND vocabulario_id = ?",
+        [nextLevel, nextScore, userId, word.vocabulario_id]
+      );
+    }
+  }
+
+  const selected = [];
+  for (let level = 0; level < LEVEL_RULES.length; level += 1) {
+    const rule = LEVEL_RULES[level];
+    const eligible = studyRows.filter((word) => {
+      if (Number(word.nivel) !== level) return false;
+      if (!rule.waitMs) return true;
+      const reviewedAt = new Date(word.ultima_revisao || word.created_at || 0).getTime();
+      return Number.isFinite(reviewedAt) && now.getTime() - reviewedAt >= rule.waitMs;
+    });
+    selected.push(...eligible.slice(0, wordsPerLevel));
+  }
+
+  const groups = [];
+  for (const word of selected) {
+    const level = Number(word.nivel);
+    const rule = LEVEL_RULES[level];
+    const [exampleRows] = await connection.execute(
+      `SELECT id, texto, traducao, resposta
+      FROM exemplo
+      WHERE vocabulario_id = ? AND resposta IS NOT NULL AND resposta <> ''
+      ORDER BY ordem ASC, id ASC`,
+      [word.vocabulario_id]
+    );
+    if (exampleRows.length < 10) continue;
+
+    const wordKey = crypto.randomUUID();
+    const exercises = [{
+      id: crypto.randomUUID(),
+      wordKey,
+      vocabularyId: Number(word.vocabulario_id),
+      writing: word.escrita,
+      type: "meaning",
+      prompt: word.significado,
+      translation: "Digite a palavra ou expressao descrita acima.",
+      expectedAnswer: word.escrita,
+      hint: buildVocabularyHint(word.escrita, Number(word.score)),
+      level,
+      maxDelta: rule.maxDelta,
+      answered: false
+    }];
+
+    shuffleArray(exampleRows).slice(0, rule.exampleCount).forEach((example) => {
+      exercises.push({
+        id: crypto.randomUUID(),
+        wordKey,
+        vocabularyId: Number(word.vocabulario_id),
+        writing: word.escrita,
+        type: "example",
+        prompt: example.texto,
+        translation: example.traducao || "",
+        expectedAnswer: example.resposta,
+        hint: buildVocabularyHint(example.resposta, Number(word.score)),
+        level,
+        maxDelta: rule.maxDelta,
+        answered: false
+      });
+    });
+
+    groups.push({
+      word: {
+        key: wordKey,
+        vocabularyId: Number(word.vocabulario_id),
+        writing: word.escrita,
+        level,
+        score: Number(word.score),
+        status: "active"
+      },
+      exercises
+    });
+  }
+
+  const shuffledGroups = shuffleArray(groups);
+  const exercises = shuffledGroups.flatMap((group) => group.exercises);
+  return {
+    version: VOCABULARY_TRAINING_VERSION,
+    id: crypto.randomUUID(),
+    createdAt: now.toISOString(),
+    status: exercises.length ? "active" : "empty",
+    currentIndex: 0,
+    wordsPerLevel,
+    words: shuffledGroups.map((group) => group.word),
+    exercises
+  };
+}
+
+async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswer) {
+  const [userRows] = await connection.execute(
+    "SELECT contexto_vocabulario_json FROM usuario WHERE id = ? LIMIT 1 FOR UPDATE",
+    [userId]
+  );
+  if (!userRows.length) {
+    const error = new Error("Usuario nao encontrado.");
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const training = parseUserContext(userRows[0].contexto_vocabulario_json);
+  if (!training || training.version !== VOCABULARY_TRAINING_VERSION || training.status !== "active") {
+    const error = new Error("Nao ha treinamento ativo.");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const exercise = training.exercises.find((item) => item.id === exerciseId);
+  if (!exercise) {
+    const error = new Error("Exercicio nao pertence ao treinamento atual.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (exercise.answered) {
+    return { ok: true, repeated: true, result: publicExerciseResult(exercise), training: publicVocabularyTraining(training) };
+  }
+
+  const current = training.exercises[training.currentIndex];
+  if (!current || current.id !== exercise.id) {
+    const error = new Error("Responda o exercicio atual antes de continuar.");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const accuracy = calculateAnswerAccuracy(rawAnswer, exercise.expectedAnswer);
+  const delta = Math.round(Number(exercise.maxDelta) * (2 * accuracy - 1));
+  exercise.answered = true;
+  exercise.response = rawAnswer;
+  exercise.accuracy = accuracy;
+  exercise.delta = delta;
+  exercise.correctAnswer = exercise.expectedAnswer;
+  exercise.answeredAt = new Date().toISOString();
+
+  const word = training.words.find((item) => item.key === exercise.wordKey);
+  if (!word) throw new Error("Palavra do exercicio nao encontrada no contexto.");
+  word.score = Number(word.score) + delta;
+
+  let promoted = false;
+  let graduated = false;
+  if (word.score > 99) {
+    promoted = true;
+    word.status = "promoted";
+    training.exercises.forEach((item) => {
+      if (item.wordKey === word.key && !item.answered) item.skipped = true;
+    });
+    if (Number(word.level) >= LEVEL_RULES.length - 1) {
+      graduated = true;
+      word.status = "graduated";
+      await connection.execute(
+        "DELETE FROM estuda_palavra WHERE usuario_id = ? AND vocabulario_id = ?",
+        [userId, word.vocabularyId]
+      );
+    } else {
+      word.level = Number(word.level) + 1;
+      word.score = 0;
+      await connection.execute(
+        `UPDATE estuda_palavra
+        SET nivel = ?, score = 0, ultima_revisao = CURRENT_TIMESTAMP
+        WHERE usuario_id = ? AND vocabulario_id = ?`,
+        [word.level, userId, word.vocabularyId]
+      );
+    }
+  } else {
+    await connection.execute(
+      "UPDATE estuda_palavra SET score = ? WHERE usuario_id = ? AND vocabulario_id = ?",
+      [word.score, userId, word.vocabularyId]
+    );
+  }
+
+  training.currentIndex = findNextVocabularyExerciseIndex(training.exercises, training.currentIndex + 1);
+  const wordHasPendingExercises = training.exercises.some((item) => item.wordKey === word.key && !item.answered && !item.skipped);
+  if (!wordHasPendingExercises && !promoted) {
+    word.status = "completed";
+    await connection.execute(
+      "UPDATE estuda_palavra SET ultima_revisao = CURRENT_TIMESTAMP WHERE usuario_id = ? AND vocabulario_id = ?",
+      [userId, word.vocabularyId]
+    );
+  }
+  if (training.currentIndex >= training.exercises.length) {
+    training.status = "completed";
+    training.completedAt = new Date().toISOString();
+  }
+
+  await saveVocabularyTraining(connection, userId, training);
+  return {
+    ok: true,
+    result: { ...publicExerciseResult(exercise), promoted, graduated },
+    training: publicVocabularyTraining(training)
+  };
+}
+
+function findNextVocabularyExerciseIndex(exercises, startIndex) {
+  for (let index = startIndex; index < exercises.length; index += 1) {
+    if (!exercises[index].answered && !exercises[index].skipped) return index;
+  }
+  return exercises.length;
+}
+
+async function saveVocabularyTraining(connection, userId, training) {
+  const serialized = JSON.stringify(training);
+  if (Buffer.byteLength(serialized, "utf8") > 4 * 1024 * 1024) {
+    throw new Error("Contexto do treinamento ficou grande demais.");
+  }
+  await connection.execute(
+    "UPDATE usuario SET contexto_vocabulario_json = ? WHERE id = ?",
+    [serialized, userId]
+  );
+}
+
+function publicVocabularyTraining(training) {
+  if (!training) return null;
+  const copy = JSON.parse(JSON.stringify(training));
+  copy.exercises = (copy.exercises || []).map((exercise) => {
+    delete exercise.expectedAnswer;
+    if (!exercise.answered) delete exercise.correctAnswer;
+    return exercise;
+  });
+  copy.totalExercises = copy.exercises.filter((item) => !item.skipped).length;
+  copy.answeredExercises = copy.exercises.filter((item) => item.answered).length;
+  return copy;
+}
+
+function publicExerciseResult(exercise) {
+  return {
+    exerciseId: exercise.id,
+    response: exercise.response,
+    correctAnswer: exercise.correctAnswer,
+    accuracy: exercise.accuracy,
+    delta: exercise.delta
+  };
+}
+
+function buildVocabularyHint(answer, score) {
+  const characters = Array.from(String(answer || ""));
+  const candidates = characters.map((character, index) => /[\p{L}\p{N}]/u.test(character) ? index : -1).filter((index) => index >= 0);
+  const percentage = Math.max(0, Math.min(50, (90 - Number(score || 0)) * 0.5 + 5));
+  const revealCount = Math.min(candidates.length, Math.max(0, Math.round(candidates.length * percentage / 100)));
+  const revealed = new Set(shuffleArray(candidates).slice(0, revealCount));
+  return characters.map((character, index) => {
+    if (!/[\p{L}\p{N}]/u.test(character)) return character;
+    return revealed.has(index) ? character : "_";
+  }).join(" ").replace(/  +/g, "  ");
+}
+
+function calculateAnswerAccuracy(actual, expected) {
+  const left = normalizeTrainingAnswer(actual);
+  const right = normalizeTrainingAnswer(expected);
+  if (!left && !right) return 1;
+  const longest = Math.max(left.length, right.length, 1);
+  return Math.max(0, Math.min(1, 1 - levenshteinDistance(left, right) / longest));
+}
+
+function normalizeTrainingAnswer(value) {
+  return String(value || "").normalize("NFKC").trim().toLocaleLowerCase("en-US").replace(/\s+/g, " ");
+}
+
+function levenshteinDistance(left, right) {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1] + 1,
+        previous[rightIndex] + 1,
+        previous[rightIndex - 1] + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1)
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[right.length];
+}
+
+function shuffleArray(items) {
+  const copy = Array.from(items || []);
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const randomIndex = crypto.randomInt(index + 1);
+    [copy[index], copy[randomIndex]] = [copy[randomIndex], copy[index]];
+  }
+  return copy;
 }
 
 function createFactoryToken() {
