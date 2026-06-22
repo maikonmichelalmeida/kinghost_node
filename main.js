@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-08";
+const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-09";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -1360,7 +1360,7 @@ async function readPendingVocabulary(connection) {
   }));
 }
 
-const VOCABULARY_TRAINING_VERSION = 5;
+const VOCABULARY_TRAINING_VERSION = 6;
 const VOCABULARY_TRAINING_INTERVAL_MS = 23 * 60 * 60 * 1000;
 const LEVEL_RULES = [
   { waitMs: 0, exampleCount: 10, maxDelta: 10 },
@@ -1559,7 +1559,7 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
   }
 
   const accuracy = calculateAnswerAccuracy(rawAnswer, exercise.expectedAnswer, exercise.writing);
-  const delta = Math.round(Number(exercise.maxDelta) * (2 * accuracy - 1));
+  const delta = calculateExerciseDelta(accuracy, Number(exercise.maxDelta));
   exercise.answered = true;
   exercise.response = rawAnswer;
   exercise.accuracy = accuracy;
@@ -1603,6 +1603,7 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
       "UPDATE estuda_palavra SET score = ? WHERE usuario_id = ? AND vocabulario_id = ?",
       [word.score, userId, word.vocabularyId]
     );
+    refreshPendingWordHints(training, word);
   }
 
   training.currentIndex = findNextVocabularyExerciseIndex(training.exercises, training.currentIndex + 1);
@@ -1803,9 +1804,7 @@ function buildHintedPromptParts(prompt, answer, writing, score) {
       if (/[\p{L}\p{N}]/u.test(character)) candidates.push(`${segmentIndex}:${characterIndex}`);
     });
   });
-  const boundedScore = Math.max(0, Math.min(75, Number(score || 0)));
-  const percentage = 50 * (1 - boundedScore / 75);
-  const revealCount = Math.min(candidates.length, Math.max(0, Math.round(candidates.length * percentage / 100)));
+  const revealCount = calculateHintCharacterCount(candidates.length, score);
   const revealed = new Set(shuffleArray(candidates).slice(0, revealCount));
   const parts = [];
   const blankPattern = /_+(?:[ \t]_+)*/g;
@@ -1833,6 +1832,33 @@ function buildHintedPromptParts(prompt, answer, writing, score) {
   }
   if (cursor < String(prompt || "").length) parts.push({ type: "text", text: prompt.slice(cursor) });
   return parts.length ? parts : [{ type: "text", text: String(prompt || "") }];
+}
+
+function calculateHintCharacterCount(characterCount, score) {
+  const total = Math.max(0, Math.floor(Number(characterCount) || 0));
+  const boundedScore = Math.max(0, Math.min(80, Number(score) || 0));
+  const revealRatio = 0.5 * (1 - boundedScore / 80);
+  return Math.min(total, Math.max(0, Math.round(total * revealRatio)));
+}
+
+function refreshPendingWordHints(training, word) {
+  training.exercises.forEach((exercise) => {
+    if (exercise.wordKey !== word.key || exercise.answered || exercise.skipped) return;
+    exercise.promptParts = buildHintedPromptParts(
+      exercise.prompt,
+      exercise.expectedAnswer,
+      exercise.writing,
+      Number(word.score)
+    );
+  });
+}
+
+function calculateExerciseDelta(accuracy, maximumDelta) {
+  const precision = Math.max(0, Math.min(1, Number(accuracy) || 0));
+  const maximum = Math.max(0, Number(maximumDelta) || 0);
+  if (precision <= 0.5) return -Math.round(maximum);
+  const normalized = (precision - 0.5) / 0.5;
+  return Math.round(-maximum + normalized * maximum * 2);
 }
 
 function calculateAnswerAccuracy(actual, expected, writing) {
