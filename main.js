@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-21-user-context-01";
+const DEPLOY_CHECK = "node-2026-06-21-vocabulary-study-01";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -251,6 +251,89 @@ async function handleApi(request, response, apiPath) {
     return;
   }
 
+  if (apiPath === "/api/user/vocabulary" && request.method === "POST") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+
+    const body = await readJsonBody(request);
+    const writing = normalizeVocabularyWriting(body.writing);
+    if (!writing || !/[\p{L}\p{N}]/u.test(writing)) {
+      sendJson(response, 400, { error: "Informe uma palavra ou expressao valida." });
+      return;
+    }
+    if (writing.length > 255) {
+      sendJson(response, 400, { error: "A palavra ou expressao deve ter no maximo 255 caracteres." });
+      return;
+    }
+
+    const connection = await openDb();
+    try {
+      await connection.beginTransaction();
+      const [userRows] = await connection.execute(
+        "SELECT id FROM usuario WHERE id = ? LIMIT 1",
+        [userToken.userId]
+      );
+      if (!userRows.length) {
+        await connection.rollback();
+        sendJson(response, 401, { error: "Usuario nao encontrado." });
+        return;
+      }
+
+      const [vocabularyRows] = await connection.execute(
+        "SELECT id, escrita, significado FROM vocabulario WHERE escrita = ? LIMIT 1 FOR UPDATE",
+        [writing]
+      );
+      let vocabulary = vocabularyRows[0];
+      let created = false;
+
+      if (!vocabulary) {
+        const [insertResult] = await connection.execute(
+          "INSERT INTO vocabulario (escrita, significado) VALUES (?, NULL)",
+          [writing]
+        );
+        vocabulary = { id: insertResult.insertId, escrita: writing, significado: null };
+        created = true;
+      }
+
+      let queued = false;
+      if (vocabulary.significado === null) {
+        const [queueResult] = await connection.execute(
+          "INSERT IGNORE INTO fila_vocabulario (escrita) VALUES (?)",
+          [vocabulary.escrita]
+        );
+        queued = queueResult.affectedRows > 0;
+      }
+
+      const [linkResult] = await connection.execute(
+        "INSERT IGNORE INTO estuda_palavra (usuario_id, vocabulario_id, nivel, score) VALUES (?, ?, 0, 0)",
+        [userToken.userId, vocabulary.id]
+      );
+      const linked = linkResult.affectedRows > 0;
+
+      await connection.commit();
+      sendJson(response, created ? 201 : 200, {
+        ok: true,
+        created,
+        queued,
+        linked,
+        vocabulary: {
+          id: vocabulary.id,
+          writing: vocabulary.escrita,
+          ready: vocabulary.significado !== null
+        }
+      });
+      return;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      await connection.end();
+    }
+  }
+
   const publicLessonIdMatch = apiPath.match(/^\/api\/public\/lessons\/(\d+)$/);
   const publicLeituraIdMatch = apiPath.match(/^\/api\/public\/leitura\/(\d+)$/);
 
@@ -421,6 +504,7 @@ function getApiPath(pathname) {
     pathname === "/user/login" ||
     pathname === "/user/session" ||
     pathname === "/user/context" ||
+    pathname === "/user/vocabulary" ||
     pathname === "/lessons" ||
     pathname.startsWith("/lessons/")
   ) {
@@ -643,6 +727,14 @@ function parseUserContext(value) {
   } catch {
     return null;
   }
+}
+
+function normalizeVocabularyWriting(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s*\*\s*/g, " * ")
+    .replace(/\s+/g, " ");
 }
 
 function createFactoryToken() {
