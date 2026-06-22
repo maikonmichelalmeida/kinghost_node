@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-21-vocabulary-queue-01";
+const DEPLOY_CHECK = "node-2026-06-22-pending-vocabulary-factory-01";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -440,6 +440,22 @@ async function handleApi(request, response, apiPath) {
     return;
   }
 
+  if (apiPath === "/api/vocabulary/pending" && request.method === "GET") {
+    const connection = await openDb();
+    const [rows] = await connection.query(
+      "SELECT id, escrita, created_at FROM fila_vocabulario ORDER BY created_at ASC, id ASC"
+    );
+    await connection.end();
+    sendJson(response, 200, {
+      items: rows.map((item) => ({
+        id: item.id,
+        writing: item.escrita,
+        createdAt: item.created_at
+      }))
+    });
+    return;
+  }
+
   const lessonIdMatch = apiPath.match(/^\/api\/lessons\/(\d+)$/);
 
   if (apiPath === "/api/lessons" && request.method === "GET") {
@@ -526,6 +542,7 @@ function getApiPath(pathname) {
     pathname === "/user/session" ||
     pathname === "/user/context" ||
     pathname === "/user/vocabulary" ||
+    pathname === "/vocabulary/pending" ||
     pathname === "/lessons" ||
     pathname.startsWith("/lessons/")
   ) {
@@ -892,4 +909,4 @@ function unescapeLooseString(value) {
     .replace(/\\r/g, "\r")
     .replace(/\\t/g, "\t");
 }
-// maikon 2026
+// maikon m. 2026
