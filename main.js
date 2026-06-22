@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-pending-vocabulary-factory-01";
+const DEPLOY_CHECK = "node-2026-06-22-vocabulary-processing-01";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -282,36 +282,24 @@ async function handleApi(request, response, apiPath) {
         return;
       }
 
-      const [vocabularyRows] = await connection.execute(
-        "SELECT id, escrita, significado FROM vocabulario WHERE escrita = ? LIMIT 1 FOR UPDATE",
-        [writing]
-      );
-      let vocabulary = vocabularyRows[0];
-      let created = false;
-
-      if (!vocabulary) {
-        const [insertResult] = await connection.execute(
-          "INSERT INTO vocabulario (escrita, significado) VALUES (?, NULL)",
-          [writing]
-        );
-        vocabulary = { id: insertResult.insertId, escrita: writing, significado: null };
-        created = true;
-      }
-
-      let queued = false;
-      if (vocabulary.significado === null) {
-        const [queueResult] = await connection.execute(
-          "INSERT IGNORE INTO fila_vocabulario (escrita) VALUES (?)",
-          [vocabulary.escrita]
-        );
-        queued = queueResult.affectedRows > 0;
-      }
-
-      const [linkResult] = await connection.execute(
-        "INSERT IGNORE INTO estuda_palavra (usuario_id, vocabulario_id, nivel, score) VALUES (?, ?, 0, 0)",
+      const resolution = await resolveVocabularyForStudy(connection, writing);
+      const vocabulary = resolution.vocabulary;
+      const [existingLinks] = await connection.execute(
+        "SELECT 1 FROM estuda_palavra WHERE usuario_id = ? AND vocabulario_id = ? LIMIT 1",
         [userToken.userId, vocabulary.id]
       );
-      const linked = linkResult.affectedRows > 0;
+      const restarted = existingLinks.length > 0;
+      await connection.execute(
+        `INSERT INTO estuda_palavra
+          (usuario_id, vocabulario_id, nivel, score, created_at, updated_at)
+        VALUES (?, ?, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON DUPLICATE KEY UPDATE
+          nivel = 0,
+          score = 0,
+          created_at = CURRENT_TIMESTAMP,
+          updated_at = CURRENT_TIMESTAMP`,
+        [userToken.userId, vocabulary.id]
+      );
 
       const [studyQueue] = await connection.execute(
         `SELECT
@@ -328,11 +316,14 @@ async function handleApi(request, response, apiPath) {
       );
 
       await connection.commit();
-      sendJson(response, created ? 201 : 200, {
+      sendJson(response, resolution.created ? 201 : 200, {
         ok: true,
-        created,
-        queued,
-        linked,
+        created: resolution.created,
+        queued: resolution.queued,
+        linked: !restarted,
+        restarted,
+        requestedWriting: writing,
+        resolvedFromDerivative: resolution.resolvedFromDerivative,
         vocabulary: {
           id: vocabulary.id,
           writing: vocabulary.escrita,
@@ -456,6 +447,32 @@ async function handleApi(request, response, apiPath) {
     return;
   }
 
+  if (apiPath === "/api/vocabulary/process" && request.method === "POST") {
+    const { jsonContent } = await readJsonBody(request);
+    let payload = null;
+    try {
+      payload = parseVocabularyProcessingJson(jsonContent);
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+      return;
+    }
+
+    const connection = await openDb();
+    try {
+      await connection.beginTransaction();
+      const result = await processVocabularyPayload(connection, payload);
+      const pendingItems = await readPendingVocabulary(connection);
+      await connection.commit();
+      sendJson(response, 200, { ok: true, ...result, pendingItems });
+      return;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      await connection.end();
+    }
+  }
+
   const lessonIdMatch = apiPath.match(/^\/api\/lessons\/(\d+)$/);
 
   if (apiPath === "/api/lessons" && request.method === "GET") {
@@ -543,6 +560,7 @@ function getApiPath(pathname) {
     pathname === "/user/context" ||
     pathname === "/user/vocabulary" ||
     pathname === "/vocabulary/pending" ||
+    pathname === "/vocabulary/process" ||
     pathname === "/lessons" ||
     pathname.startsWith("/lessons/")
   ) {
@@ -689,6 +707,20 @@ async function ensureTable() {
       json_content LONGTEXT NOT NULL
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
   `);
+  await connection.execute(`
+    CREATE TABLE IF NOT EXISTS derivados (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      derivado VARCHAR(255) NOT NULL,
+      primitivo_id INT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_derivados_derivado (derivado),
+      KEY idx_derivados_primitivo (primitivo_id),
+      CONSTRAINT fk_derivados_primitivo
+        FOREIGN KEY (primitivo_id) REFERENCES vocabulario(id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+  `);
   await connection.end();
 }
 
@@ -773,6 +805,326 @@ function normalizeVocabularyWriting(value) {
     .trim()
     .replace(/\s*\*\s*/g, " * ")
     .replace(/\s+/g, " ");
+}
+
+async function resolveVocabularyForStudy(connection, requestedWriting) {
+  const [derivedRows] = await connection.execute(
+    `SELECT v.id, v.escrita, v.significado
+    FROM derivados d
+    INNER JOIN vocabulario v ON v.id = d.primitivo_id
+    WHERE d.derivado = ?
+    LIMIT 1
+    FOR UPDATE`,
+    [requestedWriting]
+  );
+
+  let vocabulary = derivedRows[0];
+  let created = false;
+  let resolvedFromDerivative = Boolean(vocabulary);
+
+  if (!vocabulary) {
+    const [vocabularyRows] = await connection.execute(
+      "SELECT id, escrita, significado FROM vocabulario WHERE escrita = ? LIMIT 1 FOR UPDATE",
+      [requestedWriting]
+    );
+    vocabulary = vocabularyRows[0];
+  }
+
+  if (!vocabulary) {
+    const [insertResult] = await connection.execute(
+      "INSERT INTO vocabulario (escrita, significado) VALUES (?, NULL)",
+      [requestedWriting]
+    );
+    vocabulary = { id: insertResult.insertId, escrita: requestedWriting, significado: null };
+    created = true;
+    resolvedFromDerivative = false;
+  }
+
+  let queued = false;
+  if (vocabulary.significado === null) {
+    const [queueResult] = await connection.execute(
+      "INSERT IGNORE INTO fila_vocabulario (escrita) VALUES (?)",
+      [vocabulary.escrita]
+    );
+    queued = queueResult.affectedRows > 0;
+  }
+
+  return { vocabulary, created, queued, resolvedFromDerivative };
+}
+
+function parseVocabularyProcessingJson(jsonContent) {
+  if (typeof jsonContent !== "string" || !jsonContent.trim()) {
+    throw new Error("Cole o JSON antes de processar.");
+  }
+
+  let text = stripBom(jsonContent.trim());
+  const fenced = text.match(/^```[^\r\n]*\r?\n([\s\S]*?)\r?\n```$/);
+  if (fenced) {
+    text = fenced[1].trim();
+  }
+
+  let payload = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error("O texto informado nao e um JSON valido.");
+  }
+
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("O JSON precisa ter um objeto na raiz.");
+  }
+  return payload;
+}
+
+async function processVocabularyPayload(connection, payload) {
+  const errors = [];
+  const derivatives = [];
+  const invalidWords = [];
+  const validWords = [];
+  const categories = new Map();
+
+  const registerCategory = (writing, category) => {
+    if (!writing) {
+      return;
+    }
+    const current = categories.get(writing) || new Set();
+    current.add(category);
+    categories.set(writing, current);
+  };
+
+  const derivativeItems = Array.isArray(payload.derivados) ? payload.derivados : [];
+  derivativeItems.forEach((item, index) => {
+    const primitive = normalizeVocabularyWriting(item?.primitivo);
+    const derived = normalizeVocabularyWriting(item?.derivado);
+    const label = derived || `derivados[${index}]`;
+    registerCategory(derived, "derivada");
+    if (!primitive || !derived) {
+      errors.push({ writing: label, message: "Informe primitivo e derivado." });
+      return;
+    }
+    if (primitive === derived) {
+      errors.push({ writing: label, message: "Primitivo e derivado nao podem ser iguais." });
+      return;
+    }
+    derivatives.push({ primitive, derived });
+  });
+
+  const invalidItems = Array.isArray(payload.invalidas) ? payload.invalidas : [];
+  invalidItems.forEach((item, index) => {
+    const writing = normalizeVocabularyWriting(item?.palavra);
+    const label = writing || `invalidas[${index}]`;
+    registerCategory(writing, "invalida");
+    if (!writing) {
+      errors.push({ writing: label, message: "Informe a palavra invalida." });
+      return;
+    }
+    invalidWords.push({ writing });
+  });
+
+  Object.entries(payload).forEach(([rawWriting, details]) => {
+    if (rawWriting === "derivados" || rawWriting === "invalidas") {
+      return;
+    }
+
+    const writing = normalizeVocabularyWriting(rawWriting);
+    registerCategory(writing, "valida");
+    const meaning = typeof details?.significado === "string" ? details.significado.trim() : "";
+    const examples = Array.isArray(details?.frases) ? details.frases : [];
+    const invalidExampleIndex = examples.findIndex((item) =>
+      !item || typeof item.ingles !== "string" || !item.ingles.trim() ||
+      typeof item.traducao !== "string" || !item.traducao.trim()
+    );
+
+    if (!writing) {
+      errors.push({ writing: rawWriting || "palavra sem nome", message: "Nome da palavra vazio." });
+      return;
+    }
+    if (!meaning) {
+      errors.push({ writing, message: "Significado ausente." });
+      return;
+    }
+    if (examples.length !== 10) {
+      errors.push({ writing, message: `Esperados 10 exemplos; recebidos ${examples.length}.` });
+      return;
+    }
+    if (invalidExampleIndex !== -1) {
+      errors.push({ writing, message: `Exemplo ${invalidExampleIndex + 1} sem ingles ou traducao.` });
+      return;
+    }
+
+    validWords.push({
+      writing,
+      meaning,
+      examples: examples.map((item) => ({
+        text: item.ingles.trim(),
+        translation: item.traducao.trim()
+      }))
+    });
+  });
+
+  const conflicts = new Set();
+  categories.forEach((value, writing) => {
+    if (value.size > 1) {
+      conflicts.add(writing);
+      errors.push({
+        writing,
+        message: `A palavra aparece em categorias conflitantes: ${Array.from(value).join(", ")}.`
+      });
+    }
+  });
+
+  let processedDerivatives = 0;
+  let processedInvalid = 0;
+  let processedValid = 0;
+
+  for (const item of derivatives) {
+    if (conflicts.has(item.derived)) {
+      continue;
+    }
+    await processDerivedVocabulary(connection, item);
+    processedDerivatives += 1;
+  }
+
+  for (const item of invalidWords) {
+    if (conflicts.has(item.writing)) {
+      continue;
+    }
+    await processInvalidVocabulary(connection, item.writing);
+    processedInvalid += 1;
+  }
+
+  for (const item of validWords) {
+    if (conflicts.has(item.writing)) {
+      continue;
+    }
+    const error = await processValidVocabulary(connection, item);
+    if (error) {
+      errors.push({ writing: item.writing, message: error });
+      continue;
+    }
+    processedValid += 1;
+  }
+
+  return {
+    processed: {
+      valid: processedValid,
+      derivatives: processedDerivatives,
+      invalid: processedInvalid
+    },
+    errors
+  };
+}
+
+async function processDerivedVocabulary(connection, item) {
+  let primitive = await findVocabularyByWriting(connection, item.primitive);
+  if (!primitive) {
+    const [result] = await connection.execute(
+      "INSERT INTO vocabulario (escrita, significado) VALUES (?, NULL)",
+      [item.primitive]
+    );
+    primitive = { id: result.insertId, escrita: item.primitive, significado: null };
+  }
+  if (primitive.significado === null) {
+    await connection.execute("INSERT IGNORE INTO fila_vocabulario (escrita) VALUES (?)", [primitive.escrita]);
+  }
+
+  const derivedVocabulary = await findVocabularyByWriting(connection, item.derived);
+  if (derivedVocabulary && derivedVocabulary.id !== primitive.id) {
+    await connection.execute(
+      `INSERT INTO estuda_palavra
+        (usuario_id, vocabulario_id, nivel, score, created_at, updated_at)
+      SELECT usuario_id, ?, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+      FROM estuda_palavra
+      WHERE vocabulario_id = ?
+      ON DUPLICATE KEY UPDATE
+        nivel = 0,
+        score = 0,
+        created_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP`,
+      [primitive.id, derivedVocabulary.id]
+    );
+    await connection.execute("DELETE FROM estuda_palavra WHERE vocabulario_id = ?", [derivedVocabulary.id]);
+    await connection.execute("UPDATE derivados SET primitivo_id = ? WHERE primitivo_id = ?", [primitive.id, derivedVocabulary.id]);
+    await connection.execute("DELETE FROM exemplo WHERE vocabulario_id = ?", [derivedVocabulary.id]);
+    await connection.execute("DELETE FROM vocabulario WHERE id = ?", [derivedVocabulary.id]);
+  }
+
+  await connection.execute(
+    `INSERT INTO derivados (derivado, primitivo_id)
+    VALUES (?, ?)
+    ON DUPLICATE KEY UPDATE primitivo_id = VALUES(primitivo_id), updated_at = CURRENT_TIMESTAMP`,
+    [item.derived, primitive.id]
+  );
+  await connection.execute("DELETE FROM fila_vocabulario WHERE escrita = ?", [item.derived]);
+}
+
+async function processInvalidVocabulary(connection, writing) {
+  await connection.execute("DELETE FROM fila_vocabulario WHERE escrita = ?", [writing]);
+  await connection.execute("DELETE FROM derivados WHERE derivado = ?", [writing]);
+  const vocabulary = await findVocabularyByWriting(connection, writing);
+  if (!vocabulary) {
+    return;
+  }
+  await connection.execute("DELETE FROM exemplo WHERE vocabulario_id = ?", [vocabulary.id]);
+  await connection.execute("DELETE FROM estuda_palavra WHERE vocabulario_id = ?", [vocabulary.id]);
+  await connection.execute("DELETE FROM vocabulario WHERE id = ?", [vocabulary.id]);
+}
+
+async function processValidVocabulary(connection, item) {
+  const vocabulary = await findVocabularyByWriting(connection, item.writing);
+  if (!vocabulary) {
+    return "A palavra nao esta em vocabulario aguardando processamento.";
+  }
+  if (vocabulary.significado !== null) {
+    return "A palavra ja possui significado e nao pode ser processada novamente.";
+  }
+
+  const [queueRows] = await connection.execute(
+    "SELECT id FROM fila_vocabulario WHERE escrita = ? LIMIT 1",
+    [item.writing]
+  );
+  if (!queueRows.length) {
+    return "A palavra nao esta na fila de processamento.";
+  }
+
+  const [derivedRows] = await connection.execute(
+    "SELECT id FROM derivados WHERE derivado = ? LIMIT 1",
+    [item.writing]
+  );
+  if (derivedRows.length) {
+    return "A palavra esta registrada como derivada.";
+  }
+
+  await connection.execute("UPDATE vocabulario SET significado = ? WHERE id = ?", [item.meaning, vocabulary.id]);
+  await connection.execute("DELETE FROM exemplo WHERE vocabulario_id = ?", [vocabulary.id]);
+  for (let index = 0; index < item.examples.length; index += 1) {
+    const example = item.examples[index];
+    await connection.execute(
+      "INSERT INTO exemplo (vocabulario_id, ordem, texto, traducao) VALUES (?, ?, ?, ?)",
+      [vocabulary.id, index + 1, example.text, example.translation]
+    );
+  }
+  await connection.execute("DELETE FROM fila_vocabulario WHERE escrita = ?", [item.writing]);
+  return "";
+}
+
+async function findVocabularyByWriting(connection, writing) {
+  const [rows] = await connection.execute(
+    "SELECT id, escrita, significado FROM vocabulario WHERE escrita = ? LIMIT 1 FOR UPDATE",
+    [writing]
+  );
+  return rows[0] || null;
+}
+
+async function readPendingVocabulary(connection) {
+  const [rows] = await connection.query(
+    "SELECT id, escrita, created_at FROM fila_vocabulario ORDER BY created_at ASC, id ASC"
+  );
+  return rows.map((item) => ({
+    id: item.id,
+    writing: item.escrita,
+    createdAt: item.created_at
+  }));
 }
 
 function createFactoryToken() {
