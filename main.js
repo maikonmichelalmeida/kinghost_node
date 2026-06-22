@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-21-vocabulary-study-01";
+const DEPLOY_CHECK = "node-2026-06-21-vocabulary-queue-01";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -313,6 +313,20 @@ async function handleApi(request, response, apiPath) {
       );
       const linked = linkResult.affectedRows > 0;
 
+      const [studyQueue] = await connection.execute(
+        `SELECT
+          v.id,
+          v.escrita,
+          ep.nivel,
+          ep.score,
+          ep.created_at
+        FROM estuda_palavra ep
+        INNER JOIN vocabulario v ON v.id = ep.vocabulario_id
+        WHERE ep.usuario_id = ?
+        ORDER BY ep.nivel ASC, ep.score ASC, ep.created_at ASC, v.id ASC`,
+        [userToken.userId]
+      );
+
       await connection.commit();
       sendJson(response, created ? 201 : 200, {
         ok: true,
@@ -323,7 +337,14 @@ async function handleApi(request, response, apiPath) {
           id: vocabulary.id,
           writing: vocabulary.escrita,
           ready: vocabulary.significado !== null
-        }
+        },
+        studyQueue: studyQueue.map((item) => ({
+          id: item.id,
+          writing: item.escrita,
+          level: item.nivel,
+          score: item.score,
+          createdAt: item.created_at
+        }))
       });
       return;
     } catch (error) {
