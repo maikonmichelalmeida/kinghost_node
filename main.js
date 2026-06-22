@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-02";
+const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-03";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -1297,7 +1297,7 @@ async function readPendingVocabulary(connection) {
   }));
 }
 
-const VOCABULARY_TRAINING_VERSION = 1;
+const VOCABULARY_TRAINING_VERSION = 2;
 const VOCABULARY_TRAINING_INTERVAL_MS = 23 * 60 * 60 * 1000;
 const LEVEL_RULES = [
   { waitMs: 0, exampleCount: 10, maxDelta: 10 },
@@ -1447,7 +1447,7 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
   }
 
   const shuffledGroups = shuffleArray(groups);
-  const exercises = shuffledGroups.flatMap((group) => group.exercises);
+  const exercises = shuffleArray(shuffledGroups.flatMap((group) => group.exercises));
   return {
     version: VOCABULARY_TRAINING_VERSION,
     id: crypto.randomUUID(),
@@ -1613,8 +1613,10 @@ function publicExerciseResult(exercise) {
 function buildVocabularyHint(answer, score) {
   const characters = Array.from(String(answer || ""));
   const candidates = characters.map((character, index) => /[\p{L}\p{N}]/u.test(character) ? index : -1).filter((index) => index >= 0);
-  const percentage = Math.max(0, Math.min(50, (90 - Number(score || 0)) * 0.5 + 5));
+  const boundedScore = Math.max(0, Math.min(75, Number(score || 0)));
+  const percentage = 50 * (1 - boundedScore / 75);
   const revealCount = Math.min(candidates.length, Math.max(0, Math.round(candidates.length * percentage / 100)));
+  if (!revealCount) return "";
   const revealed = new Set(shuffleArray(candidates).slice(0, revealCount));
   return characters.map((character, index) => {
     if (!/[\p{L}\p{N}]/u.test(character)) return character;
