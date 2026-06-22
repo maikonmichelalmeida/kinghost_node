@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-21-user-login-01";
+const DEPLOY_CHECK = "node-2026-06-21-user-context-01";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -195,6 +195,62 @@ async function handleApi(request, response, apiPath) {
     return;
   }
 
+  if (apiPath === "/api/user/context" && request.method === "GET") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+
+    const connection = await openDb();
+    const [rows] = await connection.execute(
+      "SELECT json_contexto FROM usuario WHERE id = ? LIMIT 1",
+      [userToken.userId]
+    );
+    await connection.end();
+    if (!rows.length) {
+      sendJson(response, 401, { error: "Usuario nao encontrado." });
+      return;
+    }
+
+    sendJson(response, 200, { context: parseUserContext(rows[0].json_contexto) });
+    return;
+  }
+
+  if (apiPath === "/api/user/context" && request.method === "PUT") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+
+    const { context } = await readJsonBody(request);
+    if (context !== null && (!context || typeof context !== "object" || Array.isArray(context))) {
+      sendJson(response, 400, { error: "Contexto invalido." });
+      return;
+    }
+
+    const serialized = context === null ? null : JSON.stringify(context);
+    if (serialized && Buffer.byteLength(serialized, "utf8") > 2 * 1024 * 1024) {
+      sendJson(response, 413, { error: "Contexto grande demais." });
+      return;
+    }
+
+    const connection = await openDb();
+    const [result] = await connection.execute(
+      "UPDATE usuario SET json_contexto = ? WHERE id = ?",
+      [serialized, userToken.userId]
+    );
+    await connection.end();
+    if (!result.affectedRows) {
+      sendJson(response, 401, { error: "Usuario nao encontrado." });
+      return;
+    }
+
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
   const publicLessonIdMatch = apiPath.match(/^\/api\/public\/lessons\/(\d+)$/);
   const publicLeituraIdMatch = apiPath.match(/^\/api\/public\/leitura\/(\d+)$/);
 
@@ -364,6 +420,7 @@ function getApiPath(pathname) {
     pathname === "/session" ||
     pathname === "/user/login" ||
     pathname === "/user/session" ||
+    pathname === "/user/context" ||
     pathname === "/lessons" ||
     pathname.startsWith("/lessons/")
   ) {
@@ -574,6 +631,18 @@ function formatLeituraRow(row) {
     json_content: row.json_content,
     content
   };
+}
+
+function parseUserContext(value) {
+  if (!value) {
+    return null;
+  }
+  try {
+    const context = JSON.parse(String(value));
+    return context && typeof context === "object" && !Array.isArray(context) ? context : null;
+  } catch {
+    return null;
+  }
 }
 
 function createFactoryToken() {
