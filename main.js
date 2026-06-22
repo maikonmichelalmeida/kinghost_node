@@ -1360,7 +1360,7 @@ async function readPendingVocabulary(connection) {
   }));
 }
 
-const VOCABULARY_TRAINING_VERSION = 6;
+const VOCABULARY_TRAINING_VERSION = 7;
 const VOCABULARY_TRAINING_INTERVAL_MS = 23 * 60 * 60 * 1000;
 const LEVEL_RULES = [
   { waitMs: 0, exampleCount: 10, maxDelta: 10 },
@@ -1464,20 +1464,24 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
     if (exampleRows.length < 10) continue;
 
     const wordKey = crypto.randomUUID();
-    const exercises = [{
-      id: crypto.randomUUID(),
-      wordKey,
-      vocabularyId: Number(word.vocabulario_id),
-      writing: word.escrita,
-      type: "meaning",
-      prompt: word.significado,
-      translation: "Digite a palavra ou expressao descrita acima.",
-      expectedAnswer: word.escrita,
-      promptParts: buildHintedPromptParts(word.significado, word.escrita, word.escrita, Number(word.score)),
-      level,
-      maxDelta: rule.maxDelta,
-      answered: false
-    }];
+    const score = Number(word.score);
+    const exercises = [];
+    if (score >= 0 && score <= 5) {
+      exercises.push({
+        id: crypto.randomUUID(),
+        wordKey,
+        vocabularyId: Number(word.vocabulario_id),
+        writing: word.escrita,
+        type: "meaning",
+        prompt: word.significado,
+        translation: "Digite a palavra ou expressao descrita acima.",
+        expectedAnswer: word.escrita,
+        promptParts: buildHintedPromptParts(word.significado, word.escrita, word.escrita, score),
+        level,
+        maxDelta: rule.maxDelta,
+        answered: false
+      });
+    }
 
     shuffleArray(exampleRows).slice(0, rule.exampleCount).forEach((example) => {
       exercises.push({
@@ -1489,7 +1493,7 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
         prompt: example.texto,
         translation: example.traducao || "",
         expectedAnswer: example.resposta,
-        promptParts: buildHintedPromptParts(example.texto, example.resposta, word.escrita, Number(word.score)),
+        promptParts: buildHintedPromptParts(example.texto, example.resposta, word.escrita, score),
         level,
         maxDelta: rule.maxDelta,
         answered: false
@@ -1502,7 +1506,7 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
         vocabularyId: Number(word.vocabulario_id),
         writing: word.escrita,
         level,
-        score: Number(word.score),
+        score,
         status: "active"
       },
       exercises
@@ -1510,7 +1514,7 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
   }
 
   const shuffledGroups = shuffleArray(groups);
-  const exercises = shuffleArray(shuffledGroups.flatMap((group) => group.exercises));
+  const exercises = shuffleVocabularyExercises(shuffledGroups);
   return {
     version: VOCABULARY_TRAINING_VERSION,
     id: crypto.randomUUID(),
@@ -1910,6 +1914,23 @@ function shuffleArray(items) {
     [copy[index], copy[randomIndex]] = [copy[randomIndex], copy[index]];
   }
   return copy;
+}
+
+function shuffleVocabularyExercises(groups) {
+  const allExercises = groups.flatMap((group) => group.exercises || []);
+  const exercises = shuffleArray(allExercises.filter((exercise) => exercise.type !== "meaning"));
+  const introductions = shuffleArray(allExercises.filter((exercise) => exercise.type === "meaning"));
+
+  introductions.forEach((introduction) => {
+    const firstWordExercise = exercises.findIndex((exercise) => exercise.wordKey === introduction.wordKey);
+    if (firstWordExercise === -1) {
+      exercises.push(introduction);
+      return;
+    }
+    exercises.splice(firstWordExercise, 0, introduction);
+  });
+
+  return exercises;
 }
 
 function createFactoryToken() {
