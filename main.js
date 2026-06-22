@@ -1565,6 +1565,7 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
   exercise.accuracy = accuracy;
   exercise.delta = delta;
   exercise.correctAnswer = exercise.expectedAnswer;
+  exercise.completedPromptParts = buildCompletedPromptParts(exercise);
   exercise.spokenText = buildSpokenExerciseText(exercise);
   exercise.answeredAt = new Date().toISOString();
 
@@ -1756,8 +1757,27 @@ function publicExerciseResult(exercise) {
     correctAnswer: exercise.correctAnswer,
     accuracy: exercise.accuracy,
     delta: exercise.delta,
-    spokenText: exercise.spokenText || ""
+    spokenText: exercise.spokenText || "",
+    completedPromptParts: exercise.completedPromptParts || []
   };
+}
+
+function buildCompletedPromptParts(exercise) {
+  return buildHintedPromptParts(
+    exercise.prompt,
+    exercise.expectedAnswer,
+    exercise.writing,
+    75
+  ).map((part) => {
+    if (part.type !== "slot") return part;
+    return {
+      ...part,
+      characters: Array.from(part.answerText || "").map((character) => ({
+        text: character,
+        hint: true
+      }))
+    };
+  });
 }
 
 function buildSpokenExerciseText(exercise) {
