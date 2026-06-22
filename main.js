@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-01";
+const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-02";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -425,7 +425,8 @@ async function handleApi(request, response, apiPath) {
   }
 
   const isUserTrainingRoute = apiPath === "/api/user/vocabulary-training" ||
-    apiPath === "/api/user/vocabulary-training/answer";
+    apiPath === "/api/user/vocabulary-training/answer" ||
+    apiPath === "/api/user/vocabulary-settings";
   const tokenPayload = isUserTrainingRoute ? null : readAuthToken(request);
   if (!isUserTrainingRoute && !tokenPayload) {
     sendJson(response, 401, { error: "Login necessario." });
@@ -508,6 +509,56 @@ async function handleApi(request, response, apiPath) {
     } finally {
       await connection.end();
     }
+  }
+
+  if (apiPath === "/api/user/vocabulary-settings" && request.method === "GET") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+    const connection = await openDb();
+    const [rows] = await connection.execute(
+      "SELECT palavras_por_dia FROM usuario WHERE id = ? LIMIT 1",
+      [userToken.userId]
+    );
+    await connection.end();
+    if (!rows.length) {
+      sendJson(response, 401, { error: "Usuario nao encontrado." });
+      return;
+    }
+    sendJson(response, 200, { wordsPerDay: Number(rows[0].palavras_por_dia) });
+    return;
+  }
+
+  if (apiPath === "/api/user/vocabulary-settings" && request.method === "PUT") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const wordsPerDay = Number(body.wordsPerDay);
+    if (!Number.isInteger(wordsPerDay) || wordsPerDay < 1 || wordsPerDay > 50) {
+      sendJson(response, 400, { error: "Escolha entre 1 e 50 palavras por nivel." });
+      return;
+    }
+    const connection = await openDb();
+    const [result] = await connection.execute(
+      `UPDATE usuario
+      SET palavras_por_dia = ?,
+        contexto_vocabulario_json = NULL,
+        data_ultimo_treino = '2000-01-01 00:00:00'
+      WHERE id = ?`,
+      [wordsPerDay, userToken.userId]
+    );
+    await connection.end();
+    if (!result.affectedRows) {
+      sendJson(response, 401, { error: "Usuario nao encontrado." });
+      return;
+    }
+    sendJson(response, 200, { ok: true, wordsPerDay });
+    return;
   }
 
   if (apiPath === "/api/vocabulary/process" && request.method === "POST") {
@@ -624,6 +675,7 @@ function getApiPath(pathname) {
     pathname === "/user/vocabulary" ||
     pathname === "/user/vocabulary-training" ||
     pathname === "/user/vocabulary-training/answer" ||
+    pathname === "/user/vocabulary-settings" ||
     pathname === "/vocabulary/pending" ||
     pathname === "/vocabulary/process" ||
     pathname === "/lessons" ||
@@ -800,6 +852,14 @@ async function ensureTable() {
     ALTER TABLE estuda_palavra
       MODIFY COLUMN score SMALLINT NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS ultima_revisao DATETIME NULL AFTER score
+  `);
+  await connection.execute(`
+    ALTER TABLE estuda_palavra
+      DROP CONSTRAINT IF EXISTS chk_estuda_palavra_score
+  `);
+  await connection.execute(`
+    ALTER TABLE estuda_palavra
+      ADD CONSTRAINT chk_estuda_palavra_score CHECK (score BETWEEN -1000 AND 100)
   `);
   await connection.end();
 }
@@ -1304,6 +1364,17 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
     }
   }
 
+  studyRows.sort((left, right) => {
+    const levelDifference = Number(left.nivel) - Number(right.nivel);
+    if (levelDifference) return levelDifference;
+    const scoreDifference = Number(left.score) - Number(right.score);
+    if (scoreDifference) return scoreDifference;
+    const leftDate = new Date(left.ultima_revisao || left.created_at || 0).getTime();
+    const rightDate = new Date(right.ultima_revisao || right.created_at || 0).getTime();
+    if (leftDate !== rightDate) return leftDate - rightDate;
+    return Number(left.vocabulario_id) - Number(right.vocabulario_id);
+  });
+
   const selected = [];
   for (let level = 0; level < LEVEL_RULES.length; level += 1) {
     const rule = LEVEL_RULES[level];
@@ -1486,7 +1557,14 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
   await saveVocabularyTraining(connection, userId, training);
   return {
     ok: true,
-    result: { ...publicExerciseResult(exercise), promoted, graduated },
+    result: {
+      ...publicExerciseResult(exercise),
+      promoted,
+      graduated,
+      writing: word.writing,
+      wordScore: graduated ? null : Number(word.score),
+      wordLevel: graduated ? null : Number(word.level)
+    },
     training: publicVocabularyTraining(training)
   };
 }
