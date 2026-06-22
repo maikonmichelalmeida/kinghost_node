@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-04";
+const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-06";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -1297,7 +1297,7 @@ async function readPendingVocabulary(connection) {
   }));
 }
 
-const VOCABULARY_TRAINING_VERSION = 3;
+const VOCABULARY_TRAINING_VERSION = 5;
 const VOCABULARY_TRAINING_INTERVAL_MS = 23 * 60 * 60 * 1000;
 const LEVEL_RULES = [
   { waitMs: 0, exampleCount: 10, maxDelta: 10 },
@@ -1495,11 +1495,6 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
     throw error;
   }
 
-  if (!hasCompleteWildcardStructure(rawAnswer, exercise.expectedAnswer, exercise.writing)) {
-    const error = new Error("Digite a expressao completa, incluindo o trecho intermediario.");
-    error.statusCode = 400;
-    throw error;
-  }
   const accuracy = calculateAnswerAccuracy(rawAnswer, exercise.expectedAnswer, exercise.writing);
   const delta = Math.round(Number(exercise.maxDelta) * (2 * accuracy - 1));
   exercise.answered = true;
@@ -1628,28 +1623,31 @@ function buildHintedPromptParts(prompt, answer, writing, score) {
   const revealCount = Math.min(candidates.length, Math.max(0, Math.round(candidates.length * percentage / 100)));
   const revealed = new Set(shuffleArray(candidates).slice(0, revealCount));
   const parts = [];
-  const blankPattern = /_+(?:\s+_+)*/g;
+  const blankPattern = /_+(?:[ \t]_+)*/g;
   let cursor = 0;
   let segmentIndex = 0;
   let match = null;
   while ((match = blankPattern.exec(String(prompt || ""))) !== null) {
-    if (match.index > cursor) parts.push({ text: prompt.slice(cursor, match.index), hint: false });
+    if (match.index > cursor) parts.push({ type: "text", text: prompt.slice(cursor, match.index) });
     const segment = answerSegments[segmentIndex];
     if (segment === undefined) {
-      parts.push({ text: match[0], hint: false });
+      parts.push({ type: "text", text: match[0] });
     } else {
-      Array.from(segment).forEach((character, characterIndex) => {
-        if (characterIndex > 0) parts.push({ text: " ", hint: false });
+      const characters = Array.from(segment).map((character, characterIndex) => {
         const isLetter = /[\p{L}\p{N}]/u.test(character);
         const isRevealed = isLetter && revealed.has(`${segmentIndex}:${characterIndex}`);
-        parts.push({ text: isLetter ? (isRevealed ? character : "_") : character, hint: isRevealed });
+        return {
+          text: isLetter ? (isRevealed ? character : "_") : character,
+          hint: isRevealed
+        };
       });
+      parts.push({ type: "slot", expectedLength: characters.length, characters });
     }
     cursor = match.index + match[0].length;
     segmentIndex += 1;
   }
-  if (cursor < String(prompt || "").length) parts.push({ text: prompt.slice(cursor), hint: false });
-  return parts.length ? parts : [{ text: String(prompt || ""), hint: false }];
+  if (cursor < String(prompt || "").length) parts.push({ type: "text", text: prompt.slice(cursor) });
+  return parts.length ? parts : [{ type: "text", text: String(prompt || "") }];
 }
 
 function calculateAnswerAccuracy(actual, expected, writing) {
@@ -1672,13 +1670,6 @@ function getScoredAnswerSegments(answer, writing, splitForPrompt) {
   const right = rightCount ? answerWords.slice(Math.max(leftCount, answerWords.length - rightCount)) : [];
   const fixed = [...left, ...right];
   return splitForPrompt ? fixed : [fixed.join(" ")];
-}
-
-function hasCompleteWildcardStructure(actual, expected, writing) {
-  if (!normalizeVocabularyWriting(writing).includes("*")) return true;
-  const actualWords = normalizeTrainingAnswer(actual).split(" ").filter(Boolean);
-  const expectedWords = normalizeTrainingAnswer(expected).split(" ").filter(Boolean);
-  return actualWords.length === expectedWords.length;
 }
 
 function normalizeTrainingAnswer(value) {
