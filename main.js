@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-06";
+const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-07";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -426,6 +426,7 @@ async function handleApi(request, response, apiPath) {
 
   const isUserTrainingRoute = apiPath === "/api/user/vocabulary-training" ||
     apiPath === "/api/user/vocabulary-training/answer" ||
+    apiPath === "/api/user/vocabulary-training/reveal" ||
     apiPath === "/api/user/vocabulary-settings";
   const tokenPayload = isUserTrainingRoute ? null : readAuthToken(request);
   if (!isUserTrainingRoute && !tokenPayload) {
@@ -495,6 +496,39 @@ async function handleApi(request, response, apiPath) {
     try {
       await connection.beginTransaction();
       const result = await answerVocabularyExercise(connection, userToken.userId, exerciseId, answer);
+      await connection.commit();
+      sendJson(response, 200, result);
+      return;
+    } catch (error) {
+      await connection.rollback();
+      const status = Number(error.statusCode || 500);
+      if (status < 500) {
+        sendJson(response, status, { error: error.message });
+        return;
+      }
+      throw error;
+    } finally {
+      await connection.end();
+    }
+  }
+
+  if (apiPath === "/api/user/vocabulary-training/reveal" && request.method === "POST") {
+    const userToken = readUserAuthToken(request);
+    if (!userToken) {
+      sendJson(response, 401, { error: "Login necessario." });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const exerciseId = String(body.exerciseId || "").trim();
+    if (!exerciseId) {
+      sendJson(response, 400, { error: "Informe o exercicio." });
+      return;
+    }
+
+    const connection = await openDb();
+    try {
+      await connection.beginTransaction();
+      const result = await revealVocabularyExercise(connection, userToken.userId, exerciseId);
       await connection.commit();
       sendJson(response, 200, result);
       return;
@@ -675,6 +709,7 @@ function getApiPath(pathname) {
     pathname === "/user/vocabulary" ||
     pathname === "/user/vocabulary-training" ||
     pathname === "/user/vocabulary-training/answer" ||
+    pathname === "/user/vocabulary-training/reveal" ||
     pathname === "/user/vocabulary-settings" ||
     pathname === "/vocabulary/pending" ||
     pathname === "/vocabulary/process" ||
@@ -1566,6 +1601,91 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
       wordLevel: graduated ? null : Number(word.level)
     },
     training: publicVocabularyTraining(training)
+  };
+}
+
+async function revealVocabularyExercise(connection, userId, exerciseId) {
+  const [userRows] = await connection.execute(
+    "SELECT contexto_vocabulario_json FROM usuario WHERE id = ? LIMIT 1 FOR UPDATE",
+    [userId]
+  );
+  if (!userRows.length) {
+    const error = new Error("Usuario nao encontrado.");
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const training = parseUserContext(userRows[0].contexto_vocabulario_json);
+  if (!training || training.version !== VOCABULARY_TRAINING_VERSION || training.status !== "active") {
+    const error = new Error("Nao ha treinamento ativo.");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const exercise = training.exercises.find((item) => item.id === exerciseId);
+  if (!exercise || exercise.type !== "meaning") {
+    const error = new Error("Esta opcao existe apenas no exercicio de definicao.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (exercise.answered && exercise.neutral) {
+    return {
+      ok: true,
+      repeated: true,
+      result: neutralVocabularyResult(exercise, training),
+      training: publicVocabularyTraining(training)
+    };
+  }
+
+  const current = training.exercises[training.currentIndex];
+  if (!current || current.id !== exercise.id || exercise.answered) {
+    const error = new Error("Este nao e mais o exercicio atual.");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  exercise.answered = true;
+  exercise.neutral = true;
+  exercise.response = "";
+  exercise.correctAnswer = exercise.expectedAnswer;
+  exercise.accuracy = null;
+  exercise.delta = 0;
+  exercise.answeredAt = new Date().toISOString();
+
+  const word = training.words.find((item) => item.key === exercise.wordKey);
+  if (!word) throw new Error("Palavra do exercicio nao encontrada no contexto.");
+  training.currentIndex = findNextVocabularyExerciseIndex(training.exercises, training.currentIndex + 1);
+  const wordHasPendingExercises = training.exercises.some((item) => item.wordKey === word.key && !item.answered && !item.skipped);
+  if (!wordHasPendingExercises) {
+    word.status = "completed";
+    await connection.execute(
+      "UPDATE estuda_palavra SET ultima_revisao = CURRENT_TIMESTAMP WHERE usuario_id = ? AND vocabulario_id = ?",
+      [userId, word.vocabularyId]
+    );
+  }
+  if (training.currentIndex >= training.exercises.length) {
+    training.status = "completed";
+    training.completedAt = new Date().toISOString();
+  }
+
+  await saveVocabularyTraining(connection, userId, training);
+  return {
+    ok: true,
+    result: neutralVocabularyResult(exercise, training),
+    training: publicVocabularyTraining(training)
+  };
+}
+
+function neutralVocabularyResult(exercise, training) {
+  const word = training.words.find((item) => item.key === exercise.wordKey);
+  return {
+    exerciseId: exercise.id,
+    neutral: true,
+    correctAnswer: exercise.correctAnswer,
+    writing: exercise.writing,
+    wordScore: word ? Number(word.score) : null,
+    wordLevel: word ? Number(word.level) : null,
+    delta: 0
   };
 }
 
