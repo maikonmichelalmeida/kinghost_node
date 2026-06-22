@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-07";
+const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-08";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -553,7 +553,7 @@ async function handleApi(request, response, apiPath) {
     }
     const connection = await openDb();
     const [rows] = await connection.execute(
-      "SELECT palavras_por_dia FROM usuario WHERE id = ? LIMIT 1",
+      "SELECT palavras_por_dia, narracao_feedback FROM usuario WHERE id = ? LIMIT 1",
       [userToken.userId]
     );
     await connection.end();
@@ -561,7 +561,10 @@ async function handleApi(request, response, apiPath) {
       sendJson(response, 401, { error: "Usuario nao encontrado." });
       return;
     }
-    sendJson(response, 200, { wordsPerDay: Number(rows[0].palavras_por_dia) });
+    sendJson(response, 200, {
+      wordsPerDay: Number(rows[0].palavras_por_dia),
+      narrationEnabled: Boolean(rows[0].narracao_feedback)
+    });
     return;
   }
 
@@ -572,26 +575,50 @@ async function handleApi(request, response, apiPath) {
       return;
     }
     const body = await readJsonBody(request);
+    const hasWordsPerDay = Object.prototype.hasOwnProperty.call(body, "wordsPerDay");
+    const hasNarration = Object.prototype.hasOwnProperty.call(body, "narrationEnabled");
     const wordsPerDay = Number(body.wordsPerDay);
-    if (!Number.isInteger(wordsPerDay) || wordsPerDay < 1 || wordsPerDay > 50) {
+    if (hasWordsPerDay && (!Number.isInteger(wordsPerDay) || wordsPerDay < 1 || wordsPerDay > 50)) {
       sendJson(response, 400, { error: "Escolha entre 1 e 50 palavras por nivel." });
       return;
     }
+    if (hasNarration && typeof body.narrationEnabled !== "boolean") {
+      sendJson(response, 400, { error: "Preferencia de narracao invalida." });
+      return;
+    }
+    if (!hasWordsPerDay && !hasNarration) {
+      sendJson(response, 400, { error: "Nenhuma preferencia informada." });
+      return;
+    }
     const connection = await openDb();
-    const [result] = await connection.execute(
-      `UPDATE usuario
-      SET palavras_por_dia = ?,
-        contexto_vocabulario_json = NULL,
-        data_ultimo_treino = '2000-01-01 00:00:00'
-      WHERE id = ?`,
-      [wordsPerDay, userToken.userId]
+    const [rows] = await connection.execute(
+      "SELECT palavras_por_dia, narracao_feedback FROM usuario WHERE id = ? LIMIT 1",
+      [userToken.userId]
     );
-    await connection.end();
-    if (!result.affectedRows) {
+    if (!rows.length) {
+      await connection.end();
       sendJson(response, 401, { error: "Usuario nao encontrado." });
       return;
     }
-    sendJson(response, 200, { ok: true, wordsPerDay });
+    const nextWordsPerDay = hasWordsPerDay ? wordsPerDay : Number(rows[0].palavras_por_dia);
+    const nextNarration = hasNarration ? body.narrationEnabled : Boolean(rows[0].narracao_feedback);
+    const wordsChanged = nextWordsPerDay !== Number(rows[0].palavras_por_dia);
+    await connection.execute(
+      `UPDATE usuario
+      SET palavras_por_dia = ?,
+        narracao_feedback = ?,
+        contexto_vocabulario_json = CASE WHEN ? THEN NULL ELSE contexto_vocabulario_json END,
+        data_ultimo_treino = CASE WHEN ? THEN '2000-01-01 00:00:00' ELSE data_ultimo_treino END
+      WHERE id = ?`,
+      [nextWordsPerDay, nextNarration ? 1 : 0, wordsChanged ? 1 : 0, wordsChanged ? 1 : 0, userToken.userId]
+    );
+    await connection.end();
+    sendJson(response, 200, {
+      ok: true,
+      wordsPerDay: nextWordsPerDay,
+      narrationEnabled: nextNarration,
+      trainingReset: wordsChanged
+    });
     return;
   }
 
@@ -877,7 +904,8 @@ async function ensureTable() {
     ALTER TABLE usuario
       ADD COLUMN IF NOT EXISTS palavras_por_dia SMALLINT UNSIGNED NOT NULL DEFAULT 5,
       ADD COLUMN IF NOT EXISTS data_ultimo_treino DATETIME NOT NULL DEFAULT '2000-01-01 00:00:00',
-      ADD COLUMN IF NOT EXISTS contexto_vocabulario_json LONGTEXT NULL
+      ADD COLUMN IF NOT EXISTS contexto_vocabulario_json LONGTEXT NULL,
+      ADD COLUMN IF NOT EXISTS narracao_feedback TINYINT(1) NOT NULL DEFAULT 1
   `);
   await connection.execute(`
     ALTER TABLE exemplo
@@ -1537,6 +1565,7 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
   exercise.accuracy = accuracy;
   exercise.delta = delta;
   exercise.correctAnswer = exercise.expectedAnswer;
+  exercise.spokenText = buildSpokenExerciseText(exercise);
   exercise.answeredAt = new Date().toISOString();
 
   const word = training.words.find((item) => item.key === exercise.wordKey);
@@ -1726,8 +1755,24 @@ function publicExerciseResult(exercise) {
     response: exercise.response,
     correctAnswer: exercise.correctAnswer,
     accuracy: exercise.accuracy,
-    delta: exercise.delta
+    delta: exercise.delta,
+    spokenText: exercise.spokenText || ""
   };
+}
+
+function buildSpokenExerciseText(exercise) {
+  if (exercise.type === "meaning") return String(exercise.expectedAnswer || "").trim();
+  const parts = buildHintedPromptParts(
+    exercise.prompt,
+    exercise.expectedAnswer,
+    exercise.writing,
+    75
+  );
+  return parts
+    .map((part) => part.type === "slot" ? part.answerText || "" : part.text || "")
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function buildHintedPromptParts(prompt, answer, writing, score) {
@@ -1761,7 +1806,7 @@ function buildHintedPromptParts(prompt, answer, writing, score) {
           hint: isRevealed
         };
       });
-      parts.push({ type: "slot", expectedLength: characters.length, characters });
+      parts.push({ type: "slot", expectedLength: characters.length, answerText: segment, characters });
     }
     cursor = match.index + match[0].length;
     segmentIndex += 1;
