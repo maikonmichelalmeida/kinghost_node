@@ -45,10 +45,6 @@ const DOMINO_TILE_COUNT = 28;
 const DOMINO_BELIEF_INPUT_SIZE = 165;
 const DOMINO_BELIEF_OUTPUT_SIZE = DOMINO_PLAYERS * 7 + DOMINO_PLAYERS * DOMINO_TILE_COUNT;
 const DOMINO_BELIEF_LAYER_SIZES = [DOMINO_BELIEF_INPUT_SIZE, 96, 64, DOMINO_BELIEF_OUTPUT_SIZE];
-const DOMINO_LOBO_BELIEF_SUMMARY_SIZE = 34;
-const DOMINO_LOBO_EXTRA_SIZE = 17;
-const DOMINO_LOBO_INPUT_SIZE = DOMINO_INPUT_SIZE + DOMINO_LOBO_BELIEF_SUMMARY_SIZE + DOMINO_LOBO_EXTRA_SIZE;
-const DOMINO_LOBO_LAYER_SIZES = [DOMINO_LOBO_INPUT_SIZE, 64, 32, 1];
 const DOMINO_DEFAULT_BRAIN_BASE = "basico";
 
 function loadLocalEnv() {
@@ -1158,13 +1154,10 @@ function sanitizeDominoBrainBase(value) {
 }
 
 function createDominoBrain() {
-  const lobo = { layers: createNetworkLayers(DOMINO_LOBO_LAYER_SIZES) };
   return {
     layers: createNetworkLayers(DOMINO_LAYER_SIZES),
     belief: { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
     beliefStats: createDominoBeliefStats(),
-    lobo,
-    loboStats: createDominoLoboStats(),
     games: 0,
     roundsTrained: 0,
     treinosRealizados: 0,
@@ -1204,25 +1197,13 @@ function createDominoBeliefStats() {
   };
 }
 
-function createDominoLoboStats() {
-  return {
-    trainSteps: 0,
-    avgTdError: 1,
-    lastTdError: 1,
-    valueMean: 0,
-    history: []
-  };
-}
-
 function normalizeDominoBrainForStorage(brain) {
   if (!isValidDominoBrain(brain)) return createDominoBrain();
   const roundsTrained = Number(brain.roundsTrained ?? brain.treinosRealizados) || 0;
   return {
-    ...brain,
+    layers: brain.layers,
     belief: isValidDominoBeliefNetwork(brain.belief) ? brain.belief : { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
     beliefStats: { ...createDominoBeliefStats(), ...(brain.beliefStats || {}) },
-    lobo: isValidDominoLoboNetwork(brain.lobo) ? brain.lobo : { layers: createNetworkLayers(DOMINO_LOBO_LAYER_SIZES) },
-    loboStats: { ...createDominoLoboStats(), ...(brain.loboStats || {}) },
     games: Number(brain.games) || 0,
     roundsTrained,
     treinosRealizados: roundsTrained,
@@ -1257,25 +1238,6 @@ function isValidDominoBeliefNetwork(network) {
     network.layers.every((layer, index) => {
       const outputSize = DOMINO_BELIEF_LAYER_SIZES[index + 1];
       const inputSize = DOMINO_BELIEF_LAYER_SIZES[index];
-      return (
-        Array.isArray(layer.weights) &&
-        layer.weights.length === outputSize &&
-        layer.weights.every((weights) => Array.isArray(weights) && weights.length === inputSize) &&
-        Array.isArray(layer.biases) &&
-        layer.biases.length === outputSize
-      );
-    })
-  );
-}
-
-function isValidDominoLoboNetwork(network) {
-  return (
-    network &&
-    Array.isArray(network.layers) &&
-    network.layers.length === DOMINO_LOBO_LAYER_SIZES.length - 1 &&
-    network.layers.every((layer, index) => {
-      const outputSize = DOMINO_LOBO_LAYER_SIZES[index + 1];
-      const inputSize = DOMINO_LOBO_LAYER_SIZES[index];
       return (
         Array.isArray(layer.weights) &&
         layer.weights.length === outputSize &&
