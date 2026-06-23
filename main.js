@@ -1,4 +1,4 @@
-//projeto de Maikon Michel
+//projeto de Maikon Michel, 2026
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
