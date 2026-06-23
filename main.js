@@ -42,9 +42,9 @@ const DOMINO_PLAYERS = 4;
 const DOMINO_INPUT_SIZE = 203;
 const DOMINO_LAYER_SIZES = [DOMINO_INPUT_SIZE, 96, 64, 32, 16, 1];
 const DOMINO_TILE_COUNT = 28;
-const DOMINO_BELIEF_INPUT_SIZE = 165;
-const DOMINO_BELIEF_OUTPUT_SIZE = DOMINO_PLAYERS * 7 + DOMINO_PLAYERS * DOMINO_TILE_COUNT;
-const DOMINO_BELIEF_LAYER_SIZES = [DOMINO_BELIEF_INPUT_SIZE, 96, 64, DOMINO_BELIEF_OUTPUT_SIZE];
+const DOMINO_BELIEF_CONTEXT_SIZE = 165;
+const DOMINO_BELIEF_INPUT_SIZE = DOMINO_BELIEF_CONTEXT_SIZE + DOMINO_PLAYERS + DOMINO_TILE_COUNT;
+const DOMINO_BELIEF_LAYER_SIZES = [DOMINO_BELIEF_INPUT_SIZE, 72, 40, 1];
 const DOMINO_DEFAULT_BRAIN_BASE = "basico";
 
 function loadLocalEnv() {
@@ -1180,34 +1180,39 @@ function createNetworkLayers(layerSizes) {
 function createDominoBeliefStats() {
   return {
     trainSteps: 0,
+    examplesSeen: 0,
     lastLoss: 1,
     avgLoss: 1,
-    numberAccuracy: 0,
-    tileAccuracy: 0,
-    numberPrecision: 0,
-    numberRecall: 0,
     tilePrecision: 0,
     tileRecall: 0,
-    positiveCloseness: 0,
-    positiveMetricsReady: false,
-    closeness: 0,
-    baselineCloseness: null,
-    bestCloseness: 0,
-    history: []
+    closeness: 0
   };
 }
 
 function normalizeDominoBrainForStorage(brain) {
   if (!isValidDominoBrain(brain)) return createDominoBrain();
   const roundsTrained = Number(brain.roundsTrained ?? brain.treinosRealizados) || 0;
+  const validBelief = isValidDominoBeliefNetwork(brain.belief);
   return {
     layers: brain.layers,
-    belief: isValidDominoBeliefNetwork(brain.belief) ? brain.belief : { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
-    beliefStats: { ...createDominoBeliefStats(), ...(brain.beliefStats || {}) },
+    belief: validBelief ? brain.belief : { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
+    beliefStats: validBelief ? normalizeDominoBeliefStats(brain.beliefStats) : createDominoBeliefStats(),
     games: Number(brain.games) || 0,
     roundsTrained,
     treinosRealizados: roundsTrained,
     generation: Number(brain.generation) || 0
+  };
+}
+
+function normalizeDominoBeliefStats(stats = {}) {
+  return {
+    trainSteps: Number(stats.trainSteps) || 0,
+    examplesSeen: Number(stats.examplesSeen) || 0,
+    lastLoss: Number.isFinite(Number(stats.lastLoss)) ? Number(stats.lastLoss) : 1,
+    avgLoss: Number.isFinite(Number(stats.avgLoss)) ? Number(stats.avgLoss) : 1,
+    tilePrecision: Number(stats.tilePrecision) || 0,
+    tileRecall: Number(stats.tileRecall) || 0,
+    closeness: Number(stats.closeness) || 0
   };
 }
 
