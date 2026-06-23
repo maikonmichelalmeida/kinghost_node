@@ -45,6 +45,7 @@ const DOMINO_TILE_COUNT = 28;
 const DOMINO_BELIEF_CONTEXT_SIZE = 165;
 const DOMINO_BELIEF_INPUT_SIZE = DOMINO_BELIEF_CONTEXT_SIZE + DOMINO_PLAYERS + DOMINO_TILE_COUNT;
 const DOMINO_BELIEF_LAYER_SIZES = [DOMINO_BELIEF_INPUT_SIZE, 72, 40, 1];
+const DOMINO_BELIEF_TILE_HISTORY_LIMIT = 2000;
 const DOMINO_DEFAULT_BRAIN_BASE = "basico";
 
 function loadLocalEnv() {
@@ -239,6 +240,29 @@ async function handleApi(request, response, apiPath) {
         // Keep the original database error visible to the caller.
       }
       throw error;
+    } finally {
+      await connection.end();
+    }
+    return;
+  }
+
+  const dominoBrainDeleteMatch = apiPath.match(/^\/api\/domino\/brains\/([^/]+)$/);
+  if (dominoBrainDeleteMatch && request.method === "DELETE") {
+    const baseName = sanitizeDominoBrainBase(decodeURIComponent(dominoBrainDeleteMatch[1]));
+    const body = await readJsonBody(request);
+    if (!String(body.confirmName || "").trim() || sanitizeDominoBrainBase(body.confirmName) !== baseName) {
+      sendJson(response, 400, { error: "Digite corretamente o nome do cerebro para confirmar." });
+      return;
+    }
+    const names = Array.from({ length: DOMINO_PLAYERS }, (_, index) => `${baseName}J${index + 1}`);
+    const connection = await openDb();
+    try {
+      const placeholders = names.map(() => "?").join(", ");
+      const [result] = await connection.execute(
+        `DELETE FROM JSON_conteudos WHERE nome IN (${placeholders})`,
+        names
+      );
+      sendJson(response, 200, { ok: true, baseName, deleted: result.affectedRows });
     } finally {
       await connection.end();
     }
@@ -1185,7 +1209,8 @@ function createDominoBeliefStats() {
     avgLoss: 1,
     tilePrecision: 0,
     tileRecall: 0,
-    closeness: 0
+    closeness: 0,
+    tileErrorHistory: Array.from({ length: DOMINO_TILE_COUNT }, () => [])
   };
 }
 
@@ -1212,7 +1237,16 @@ function normalizeDominoBeliefStats(stats = {}) {
     avgLoss: Number.isFinite(Number(stats.avgLoss)) ? Number(stats.avgLoss) : 1,
     tilePrecision: Number(stats.tilePrecision) || 0,
     tileRecall: Number(stats.tileRecall) || 0,
-    closeness: Number(stats.closeness) || 0
+    closeness: Number(stats.closeness) || 0,
+    tileErrorHistory: Array.from({ length: DOMINO_TILE_COUNT }, (_, index) =>
+      Array.isArray(stats.tileErrorHistory?.[index])
+        ? stats.tileErrorHistory[index]
+            .map(Number)
+            .filter(Number.isFinite)
+            .map((value) => Math.max(0, Math.min(1, value)))
+            .slice(-DOMINO_BELIEF_TILE_HISTORY_LIMIT)
+        : []
+    )
   };
 }
 
