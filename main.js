@@ -1162,16 +1162,19 @@ function createDominoBrain() {
     }),
     games: 0,
     roundsTrained: 0,
+    treinosRealizados: 0,
     generation: 0
   };
 }
 
 function normalizeDominoBrainForStorage(brain) {
   if (!isValidDominoBrain(brain)) return createDominoBrain();
+  const roundsTrained = Number(brain.roundsTrained ?? brain.treinosRealizados) || 0;
   return {
     ...brain,
     games: Number(brain.games) || 0,
-    roundsTrained: Number(brain.roundsTrained) || 0,
+    roundsTrained,
+    treinosRealizados: roundsTrained,
     generation: Number(brain.generation) || 0
   };
 }
