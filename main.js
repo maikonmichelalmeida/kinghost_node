@@ -38,6 +38,10 @@ const dbConfig = {
 const ADMIN_PASSWORD = requiredEnv("ADMIN_PASSWORD");
 const TOKEN_SECRET = requiredEnv("TOKEN_SECRET");
 const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 30;
+const DOMINO_PLAYERS = 4;
+const DOMINO_INPUT_SIZE = 203;
+const DOMINO_LAYER_SIZES = [DOMINO_INPUT_SIZE, 96, 64, 32, 16, 1];
+const DOMINO_DEFAULT_BRAIN_BASE = "basico";
 
 function loadLocalEnv() {
   const envPaths = [
@@ -110,9 +114,11 @@ const server = http.createServer(async (request, response) => {
 start();
 
 async function start() {
-  ensureTable().catch((error) => {
-    console.error("Nao foi possivel garantir a tabela lessons:", error.message);
-  });
+  try {
+    await ensureTable();
+  } catch (error) {
+    console.error("Nao foi possivel garantir as tabelas:", error.message);
+  }
   server.listen(port, () => {
     console.log(`Aplicacao rodando na porta ${port}`);
     console.log(`Arquivos estaticos: ${staticRoot || "nao encontrados"}`);
@@ -127,6 +133,111 @@ async function handleApi(request, response, apiPath) {
 
   if (apiPath === "/api/health" && request.method === "GET") {
     sendJson(response, 200, { ok: true, deployCheck: DEPLOY_CHECK });
+    return;
+  }
+
+  if (apiPath === "/api/domino/brains" && request.method === "GET") {
+    const connection = await openDb();
+    try {
+      await ensureDominoDefaultBrains(connection);
+      const [rows] = await connection.execute(
+        "SELECT id, nome, json_conteudo, data_ultima_atualizacao, data_inclusao, tempo_treino FROM JSON_conteudos ORDER BY nome"
+      );
+      sendJson(response, 200, { brains: dominoBrainOptions(rows) });
+    } finally {
+      await connection.end();
+    }
+    return;
+  }
+
+  const dominoBrainMatch = apiPath.match(/^\/api\/domino\/brains\/([1-4])\/([^/]+)$/);
+  if (dominoBrainMatch && request.method === "GET") {
+    const player = Number(dominoBrainMatch[1]);
+    const baseName = sanitizeDominoBrainBase(decodeURIComponent(dominoBrainMatch[2]));
+    const nome = `${baseName}J${player}`;
+    const connection = await openDb();
+    try {
+      await ensureDominoDefaultBrains(connection);
+      const row = await readDominoBrainRow(connection, nome);
+      if (!row) {
+        sendJson(response, 404, { error: "Cerebro nao encontrado." });
+        return;
+      }
+      sendJson(response, 200, dominoBrainPayload(row));
+    } finally {
+      await connection.end();
+    }
+    return;
+  }
+
+  if (apiPath === "/api/domino/brains" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    const player = clampInteger(body.player, 1, DOMINO_PLAYERS, 1);
+    const baseName = sanitizeDominoBrainBase(body.nome || body.baseName || "");
+    const nome = `${baseName}J${player}`;
+    const connection = await openDb();
+    try {
+      await ensureDominoDefaultBrains(connection);
+      const existing = await readDominoBrainRow(connection, nome);
+      if (existing) {
+        sendJson(response, 409, { error: "Esse cerebro ja existe.", brain: dominoBrainPayload(existing) });
+        return;
+      }
+      const brain = createDominoBrain();
+      await insertDominoBrain(connection, nome, brain, 0);
+      const row = await readDominoBrainRow(connection, nome);
+      const parsed = parseDominoBrainName(row.nome);
+      sendJson(response, 201, {
+        id: row.id,
+        nome: row.nome,
+        baseName: parsed.baseName,
+        player: parsed.player,
+        tempoTreino: Number(row.tempo_treino) || 0,
+        dataUltimaAtualizacao: row.data_ultima_atualizacao,
+        dataInclusao: row.data_inclusao
+      });
+    } finally {
+      await connection.end();
+    }
+    return;
+  }
+
+  if (apiPath === "/api/domino/brains" && request.method === "PUT") {
+    const body = await readJsonBody(request);
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (items.length === 0) {
+      sendJson(response, 400, { error: "Nenhum cerebro informado." });
+      return;
+    }
+    const connection = await openDb();
+    try {
+      await ensureDominoDefaultBrains(connection);
+      await connection.beginTransaction();
+      for (const item of items) {
+        const player = clampInteger(item.player, 1, DOMINO_PLAYERS, 1);
+        const baseName = sanitizeDominoBrainBase(item.baseName || baseNameFromDominoBrainName(item.nome));
+        const nome = `${baseName}J${player}`;
+        const brain = normalizeDominoBrainForStorage(item.brain);
+        const tempoTreino = Math.max(0, Number.parseInt(item.tempoTreino, 10) || 0);
+        await connection.execute(
+          `UPDATE JSON_conteudos
+             SET json_conteudo = ?, tempo_treino = ?, data_ultima_atualizacao = CURRENT_TIMESTAMP
+           WHERE nome = ?`,
+          [JSON.stringify(brain), tempoTreino, nome]
+        );
+      }
+      await connection.commit();
+      sendJson(response, 200, { ok: true });
+    } catch (error) {
+      try {
+        await connection.rollback();
+      } catch {
+        // Keep the original database error visible to the caller.
+      }
+      throw error;
+    } finally {
+      await connection.end();
+    }
     return;
   }
 
@@ -755,6 +866,7 @@ function getApiPath(pathname) {
 
 function findStaticRoot() {
   const candidates = [
+    path.resolve(__dirname, "..", "www", "domino"),
     path.join(__dirname, "outputs"),
     path.resolve(__dirname, ".."),
     path.join(process.cwd(), "outputs"),
@@ -762,7 +874,8 @@ function findStaticRoot() {
   ];
 
   const root = candidates.find((candidate) => {
-    return fs.existsSync(path.join(candidate, "app.js")) && fs.existsSync(path.join(candidate, "style.css"));
+    return fs.existsSync(path.join(candidate, "app.js")) &&
+      (fs.existsSync(path.join(candidate, "style.css")) || fs.existsSync(path.join(candidate, "styles.css")));
   });
 
   return root ? path.resolve(root) : "";
@@ -887,6 +1000,17 @@ async function ensureTable() {
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
   `);
   await connection.execute(`
+    CREATE TABLE IF NOT EXISTS JSON_conteudos (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      nome VARCHAR(255) NOT NULL,
+      json_conteudo LONGTEXT NOT NULL,
+      data_ultima_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      data_inclusao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      tempo_treino BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      UNIQUE KEY uq_JSON_conteudos_nome (nome)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+  `);
+  await connection.execute(`
     CREATE TABLE IF NOT EXISTS derivados (
       id INT AUTO_INCREMENT PRIMARY KEY,
       derivado VARCHAR(255) NOT NULL,
@@ -933,6 +1057,148 @@ async function ensureTable() {
       ADD CONSTRAINT chk_estuda_palavra_nivel CHECK (nivel BETWEEN 0 AND 4)
   `);
   await connection.end();
+}
+
+async function ensureDominoDefaultBrains(connection) {
+  for (let player = 1; player <= DOMINO_PLAYERS; player += 1) {
+    const nome = `${DOMINO_DEFAULT_BRAIN_BASE}J${player}`;
+    const existing = await readDominoBrainRow(connection, nome);
+    if (!existing) {
+      await insertDominoBrain(connection, nome, createDominoBrain(), 0);
+    }
+  }
+}
+
+async function readDominoBrainRow(connection, nome) {
+  const [rows] = await connection.execute(
+    "SELECT id, nome, json_conteudo, data_ultima_atualizacao, data_inclusao, tempo_treino FROM JSON_conteudos WHERE nome = ? LIMIT 1",
+    [nome]
+  );
+  return rows[0] || null;
+}
+
+async function insertDominoBrain(connection, nome, brain, tempoTreino) {
+  await connection.execute(
+    `INSERT INTO JSON_conteudos (nome, json_conteudo, tempo_treino, data_ultima_atualizacao, data_inclusao)
+     VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [nome, JSON.stringify(brain), tempoTreino]
+  );
+}
+
+function dominoBrainOptions(rows) {
+  return rows
+    .map((row) => {
+      const parsed = parseDominoBrainName(row.nome);
+      if (!parsed) return null;
+      return {
+        id: row.id,
+        nome: row.nome,
+        baseName: parsed.baseName,
+        player: parsed.player,
+        tempoTreino: Number(row.tempo_treino) || 0,
+        dataUltimaAtualizacao: row.data_ultima_atualizacao,
+        dataInclusao: row.data_inclusao
+      };
+    })
+    .filter(Boolean);
+}
+
+function dominoBrainPayload(row) {
+  const parsed = parseDominoBrainName(row.nome);
+  let brain = null;
+  try {
+    brain = JSON.parse(String(row.json_conteudo || ""));
+  } catch {
+    brain = createDominoBrain();
+  }
+  return {
+    id: row.id,
+    nome: row.nome,
+    baseName: parsed ? parsed.baseName : baseNameFromDominoBrainName(row.nome),
+    player: parsed ? parsed.player : null,
+    tempoTreino: Number(row.tempo_treino) || 0,
+    dataUltimaAtualizacao: row.data_ultima_atualizacao,
+    dataInclusao: row.data_inclusao,
+    brain: normalizeDominoBrainForStorage(brain)
+  };
+}
+
+function parseDominoBrainName(nome) {
+  const match = String(nome || "").match(/^(.+)J([1-4])$/);
+  if (!match) return null;
+  return {
+    baseName: match[1],
+    player: Number(match[2])
+  };
+}
+
+function baseNameFromDominoBrainName(nome) {
+  const parsed = parseDominoBrainName(nome);
+  return parsed ? parsed.baseName : sanitizeDominoBrainBase(nome);
+}
+
+function sanitizeDominoBrainBase(value) {
+  const cleaned = String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/J[1-4]$/i, "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+  return cleaned || DOMINO_DEFAULT_BRAIN_BASE;
+}
+
+function createDominoBrain() {
+  return {
+    layers: DOMINO_LAYER_SIZES.slice(1).map((outputSize, index) => {
+      const inputSize = DOMINO_LAYER_SIZES[index];
+      return {
+        weights: Array.from({ length: outputSize }, () =>
+          Array.from({ length: inputSize }, () => (Math.random() * 2 - 1) * Math.sqrt(2 / inputSize))
+        ),
+        biases: Array.from({ length: outputSize }, () => 0)
+      };
+    }),
+    games: 0,
+    roundsTrained: 0,
+    generation: 0
+  };
+}
+
+function normalizeDominoBrainForStorage(brain) {
+  if (!isValidDominoBrain(brain)) return createDominoBrain();
+  return {
+    ...brain,
+    games: Number(brain.games) || 0,
+    roundsTrained: Number(brain.roundsTrained) || 0,
+    generation: Number(brain.generation) || 0
+  };
+}
+
+function isValidDominoBrain(brain) {
+  return (
+    brain &&
+    Array.isArray(brain.layers) &&
+    brain.layers.length === DOMINO_LAYER_SIZES.length - 1 &&
+    brain.layers.every((layer, index) => {
+      const outputSize = DOMINO_LAYER_SIZES[index + 1];
+      const inputSize = DOMINO_LAYER_SIZES[index];
+      return (
+        Array.isArray(layer.weights) &&
+        layer.weights.length === outputSize &&
+        layer.weights.every((weights) => Array.isArray(weights) && weights.length === inputSize) &&
+        Array.isArray(layer.biases) &&
+        layer.biases.length === outputSize
+      );
+    })
+  );
+}
+
+function clampInteger(value, min, max, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
 }
 
 async function readJsonBody(request) {
