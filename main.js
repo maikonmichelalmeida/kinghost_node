@@ -1,4 +1,4 @@
-//acesso ao banco de dados: mysql2/promise
+//projeto de Maikon Michel
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
