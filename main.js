@@ -1,4 +1,4 @@
-//projeto de Maikon Michel, UERGS 2026
+//projeto de Maikon Michel, 2026
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-22-vocabulary-training-09";
+const DEPLOY_CHECK = "node-2026-06-23-vocabulary-level-4";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -314,9 +314,9 @@ async function handleApi(request, response, apiPath) {
           ep.created_at
         FROM estuda_palavra ep
         INNER JOIN vocabulario v ON v.id = ep.vocabulario_id
-        WHERE ep.usuario_id = ?
+        WHERE ep.usuario_id = ? AND ep.nivel < ?
         ORDER BY ep.nivel ASC, ep.score ASC, ep.created_at ASC, v.id ASC`,
-        [userToken.userId]
+        [userToken.userId, VOCABULARY_GRADUATED_LEVEL]
       );
 
       await connection.commit();
@@ -924,6 +924,14 @@ async function ensureTable() {
     ALTER TABLE estuda_palavra
       ADD CONSTRAINT chk_estuda_palavra_score CHECK (score BETWEEN -1000 AND 100)
   `);
+  await connection.execute(`
+    ALTER TABLE estuda_palavra
+      DROP CONSTRAINT IF EXISTS chk_estuda_palavra_nivel
+  `);
+  await connection.execute(`
+    ALTER TABLE estuda_palavra
+      ADD CONSTRAINT chk_estuda_palavra_nivel CHECK (nivel BETWEEN 0 AND 4)
+  `);
   await connection.end();
 }
 
@@ -1360,8 +1368,9 @@ async function readPendingVocabulary(connection) {
   }));
 }
 
-const VOCABULARY_TRAINING_VERSION = 7;
+const VOCABULARY_TRAINING_VERSION = 8;
 const VOCABULARY_TRAINING_INTERVAL_MS = 23 * 60 * 60 * 1000;
+const VOCABULARY_GRADUATED_LEVEL = 4;
 const LEVEL_RULES = [
   { waitMs: 0, exampleCount: 10, maxDelta: 10 },
   { waitMs: 23 * 60 * 60 * 1000, exampleCount: 7, maxDelta: 20 },
@@ -1408,10 +1417,10 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
       v.escrita, v.significado
     FROM estuda_palavra ep
     INNER JOIN vocabulario v ON v.id = ep.vocabulario_id
-    WHERE ep.usuario_id = ? AND v.significado IS NOT NULL
+    WHERE ep.usuario_id = ? AND v.significado IS NOT NULL AND ep.nivel < ?
     ORDER BY ep.nivel ASC, ep.score ASC, COALESCE(ep.ultima_revisao, ep.created_at) ASC, ep.vocabulario_id ASC
     FOR UPDATE`,
-    [userId]
+    [userId, VOCABULARY_GRADUATED_LEVEL]
   );
 
   for (const word of studyRows) {
@@ -1588,9 +1597,13 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
     if (Number(word.level) >= LEVEL_RULES.length - 1) {
       graduated = true;
       word.status = "graduated";
+      word.level = VOCABULARY_GRADUATED_LEVEL;
+      word.score = 100;
       await connection.execute(
-        "DELETE FROM estuda_palavra WHERE usuario_id = ? AND vocabulario_id = ?",
-        [userId, word.vocabularyId]
+        `UPDATE estuda_palavra
+        SET nivel = ?, score = 100, ultima_revisao = CURRENT_TIMESTAMP
+        WHERE usuario_id = ? AND vocabulario_id = ?`,
+        [VOCABULARY_GRADUATED_LEVEL, userId, word.vocabularyId]
       );
     } else {
       word.level = Number(word.level) + 1;
@@ -1632,8 +1645,8 @@ async function answerVocabularyExercise(connection, userId, exerciseId, rawAnswe
       promoted,
       graduated,
       writing: word.writing,
-      wordScore: graduated ? null : Number(word.score),
-      wordLevel: graduated ? null : Number(word.level)
+      wordScore: Number(word.score),
+      wordLevel: Number(word.level)
     },
     training: publicVocabularyTraining(training)
   };
