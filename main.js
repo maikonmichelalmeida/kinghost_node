@@ -1184,7 +1184,15 @@ function createDominoBeliefStats() {
     avgLoss: 1,
     numberAccuracy: 0,
     tileAccuracy: 0,
+    numberPrecision: 0,
+    numberRecall: 0,
+    tilePrecision: 0,
+    tileRecall: 0,
+    positiveCloseness: 0,
+    positiveMetricsReady: false,
     closeness: 0,
+    baselineCloseness: null,
+    bestCloseness: 0,
     history: []
   };
 }
