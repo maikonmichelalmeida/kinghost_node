@@ -257,12 +257,27 @@ async function handleApi(request, response, apiPath) {
     const names = Array.from({ length: DOMINO_PLAYERS }, (_, index) => `${baseName}J${index + 1}`);
     const connection = await openDb();
     try {
+      await connection.beginTransaction();
       const placeholders = names.map(() => "?").join(", ");
       const [result] = await connection.execute(
         `DELETE FROM JSON_conteudos WHERE nome IN (${placeholders})`,
         names
       );
-      sendJson(response, 200, { ok: true, baseName, deleted: result.affectedRows });
+      await ensureDominoDefaultBrains(connection);
+      await connection.commit();
+      sendJson(response, 200, {
+        ok: true,
+        baseName,
+        deleted: result.affectedRows,
+        defaultsEnsured: true
+      });
+    } catch (error) {
+      try {
+        await connection.rollback();
+      } catch {
+        // Keep the original database error visible to the caller.
+      }
+      throw error;
     } finally {
       await connection.end();
     }
