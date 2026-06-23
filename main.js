@@ -45,8 +45,10 @@ const DOMINO_TILE_COUNT = 28;
 const DOMINO_BELIEF_INPUT_SIZE = 165;
 const DOMINO_BELIEF_OUTPUT_SIZE = DOMINO_PLAYERS * 7 + DOMINO_PLAYERS * DOMINO_TILE_COUNT;
 const DOMINO_BELIEF_LAYER_SIZES = [DOMINO_BELIEF_INPUT_SIZE, 96, 64, DOMINO_BELIEF_OUTPUT_SIZE];
-const DOMINO_LOBO_INPUT_SIZE = DOMINO_INPUT_SIZE + DOMINO_BELIEF_OUTPUT_SIZE + 17;
-const DOMINO_LOBO_LAYER_SIZES = [DOMINO_LOBO_INPUT_SIZE, 128, 96, 48, 1];
+const DOMINO_LOBO_BELIEF_SUMMARY_SIZE = 34;
+const DOMINO_LOBO_EXTRA_SIZE = 17;
+const DOMINO_LOBO_INPUT_SIZE = DOMINO_INPUT_SIZE + DOMINO_LOBO_BELIEF_SUMMARY_SIZE + DOMINO_LOBO_EXTRA_SIZE;
+const DOMINO_LOBO_LAYER_SIZES = [DOMINO_LOBO_INPUT_SIZE, 64, 32, 1];
 const DOMINO_DEFAULT_BRAIN_BASE = "basico";
 
 function loadLocalEnv() {
@@ -1162,7 +1164,6 @@ function createDominoBrain() {
     belief: { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
     beliefStats: createDominoBeliefStats(),
     lobo,
-    loboTarget: cloneDominoNetwork(lobo),
     loboStats: createDominoLoboStats(),
     games: 0,
     roundsTrained: 0,
@@ -1181,15 +1182,6 @@ function createNetworkLayers(layerSizes) {
       biases: Array.from({ length: outputSize }, () => 0)
     };
   });
-}
-
-function cloneDominoNetwork(network) {
-  return {
-    layers: network.layers.map((layer) => ({
-      weights: layer.weights.map((weights) => weights.slice()),
-      biases: layer.biases.slice()
-    }))
-  };
 }
 
 function createDominoBeliefStats() {
@@ -1218,8 +1210,6 @@ function createDominoLoboStats() {
     avgTdError: 1,
     lastTdError: 1,
     valueMean: 0,
-    replaySize: 0,
-    targetSyncs: 0,
     history: []
   };
 }
@@ -1232,11 +1222,6 @@ function normalizeDominoBrainForStorage(brain) {
     belief: isValidDominoBeliefNetwork(brain.belief) ? brain.belief : { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
     beliefStats: { ...createDominoBeliefStats(), ...(brain.beliefStats || {}) },
     lobo: isValidDominoLoboNetwork(brain.lobo) ? brain.lobo : { layers: createNetworkLayers(DOMINO_LOBO_LAYER_SIZES) },
-    loboTarget: isValidDominoLoboNetwork(brain.loboTarget)
-      ? brain.loboTarget
-      : isValidDominoLoboNetwork(brain.lobo)
-        ? cloneDominoNetwork(brain.lobo)
-        : { layers: createNetworkLayers(DOMINO_LOBO_LAYER_SIZES) },
     loboStats: { ...createDominoLoboStats(), ...(brain.loboStats || {}) },
     games: Number(brain.games) || 0,
     roundsTrained,
