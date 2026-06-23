@@ -41,6 +41,10 @@ const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 const DOMINO_PLAYERS = 4;
 const DOMINO_INPUT_SIZE = 203;
 const DOMINO_LAYER_SIZES = [DOMINO_INPUT_SIZE, 96, 64, 32, 16, 1];
+const DOMINO_TILE_COUNT = 28;
+const DOMINO_BELIEF_INPUT_SIZE = 165;
+const DOMINO_BELIEF_OUTPUT_SIZE = DOMINO_PLAYERS * 7 + DOMINO_PLAYERS * DOMINO_TILE_COUNT;
+const DOMINO_BELIEF_LAYER_SIZES = [DOMINO_BELIEF_INPUT_SIZE, 96, 64, DOMINO_BELIEF_OUTPUT_SIZE];
 const DOMINO_DEFAULT_BRAIN_BASE = "basico";
 
 function loadLocalEnv() {
@@ -1151,19 +1155,37 @@ function sanitizeDominoBrainBase(value) {
 
 function createDominoBrain() {
   return {
-    layers: DOMINO_LAYER_SIZES.slice(1).map((outputSize, index) => {
-      const inputSize = DOMINO_LAYER_SIZES[index];
-      return {
-        weights: Array.from({ length: outputSize }, () =>
-          Array.from({ length: inputSize }, () => (Math.random() * 2 - 1) * Math.sqrt(2 / inputSize))
-        ),
-        biases: Array.from({ length: outputSize }, () => 0)
-      };
-    }),
+    layers: createNetworkLayers(DOMINO_LAYER_SIZES),
+    belief: { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
+    beliefStats: createDominoBeliefStats(),
     games: 0,
     roundsTrained: 0,
     treinosRealizados: 0,
     generation: 0
+  };
+}
+
+function createNetworkLayers(layerSizes) {
+  return layerSizes.slice(1).map((outputSize, index) => {
+    const inputSize = layerSizes[index];
+    return {
+      weights: Array.from({ length: outputSize }, () =>
+        Array.from({ length: inputSize }, () => (Math.random() * 2 - 1) * Math.sqrt(2 / inputSize))
+      ),
+      biases: Array.from({ length: outputSize }, () => 0)
+    };
+  });
+}
+
+function createDominoBeliefStats() {
+  return {
+    trainSteps: 0,
+    lastLoss: 1,
+    avgLoss: 1,
+    numberAccuracy: 0,
+    tileAccuracy: 0,
+    closeness: 0,
+    history: []
   };
 }
 
@@ -1172,6 +1194,8 @@ function normalizeDominoBrainForStorage(brain) {
   const roundsTrained = Number(brain.roundsTrained ?? brain.treinosRealizados) || 0;
   return {
     ...brain,
+    belief: isValidDominoBeliefNetwork(brain.belief) ? brain.belief : { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
+    beliefStats: { ...createDominoBeliefStats(), ...(brain.beliefStats || {}) },
     games: Number(brain.games) || 0,
     roundsTrained,
     treinosRealizados: roundsTrained,
@@ -1187,6 +1211,25 @@ function isValidDominoBrain(brain) {
     brain.layers.every((layer, index) => {
       const outputSize = DOMINO_LAYER_SIZES[index + 1];
       const inputSize = DOMINO_LAYER_SIZES[index];
+      return (
+        Array.isArray(layer.weights) &&
+        layer.weights.length === outputSize &&
+        layer.weights.every((weights) => Array.isArray(weights) && weights.length === inputSize) &&
+        Array.isArray(layer.biases) &&
+        layer.biases.length === outputSize
+      );
+    })
+  );
+}
+
+function isValidDominoBeliefNetwork(network) {
+  return (
+    network &&
+    Array.isArray(network.layers) &&
+    network.layers.length === DOMINO_BELIEF_LAYER_SIZES.length - 1 &&
+    network.layers.every((layer, index) => {
+      const outputSize = DOMINO_BELIEF_LAYER_SIZES[index + 1];
+      const inputSize = DOMINO_BELIEF_LAYER_SIZES[index];
       return (
         Array.isArray(layer.weights) &&
         layer.weights.length === outputSize &&
