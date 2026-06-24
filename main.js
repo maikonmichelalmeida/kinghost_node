@@ -45,7 +45,7 @@ const DOMINO_TILE_COUNT = 28;
 const DOMINO_BELIEF_CONTEXT_SIZE = 165;
 const DOMINO_BELIEF_INPUT_SIZE = DOMINO_BELIEF_CONTEXT_SIZE + DOMINO_PLAYERS + DOMINO_TILE_COUNT;
 const DOMINO_BELIEF_LAYER_SIZES = [DOMINO_BELIEF_INPUT_SIZE, 72, 40, 1];
-const DOMINO_BELIEF_TILE_HISTORY_LIMIT = 2000;
+const DOMINO_BELIEF_CHART_POINT_LIMIT = 200;
 const DOMINO_DEFAULT_BRAIN_BASE = "basico";
 
 function loadLocalEnv() {
@@ -1227,7 +1227,9 @@ function createDominoBeliefStats() {
     tilePrecision: 0,
     tileRecall: 0,
     closeness: 0,
-    tileErrorHistory: Array.from({ length: DOMINO_TILE_COUNT }, () => [])
+    chartRoundErrorSum: 0,
+    chartRoundCount: 0,
+    roundErrorHistory: []
   };
 }
 
@@ -1255,15 +1257,15 @@ function normalizeDominoBeliefStats(stats = {}) {
     tilePrecision: Number(stats.tilePrecision) || 0,
     tileRecall: Number(stats.tileRecall) || 0,
     closeness: Number(stats.closeness) || 0,
-    tileErrorHistory: Array.from({ length: DOMINO_TILE_COUNT }, (_, index) =>
-      Array.isArray(stats.tileErrorHistory?.[index])
-        ? stats.tileErrorHistory[index]
-            .map(Number)
-            .filter(Number.isFinite)
-            .map((value) => Math.max(0, Math.min(1, value)))
-            .slice(-DOMINO_BELIEF_TILE_HISTORY_LIMIT)
-        : []
-    )
+    chartRoundErrorSum: Number(stats.chartRoundErrorSum) || 0,
+    chartRoundCount: Math.max(0, Math.min(19, Number(stats.chartRoundCount) || 0)),
+    roundErrorHistory: Array.isArray(stats.roundErrorHistory)
+      ? stats.roundErrorHistory
+          .map(Number)
+          .filter(Number.isFinite)
+          .map((value) => Math.max(0, Math.min(1, value)))
+          .slice(-DOMINO_BELIEF_CHART_POINT_LIMIT)
+      : []
   };
 }
 
