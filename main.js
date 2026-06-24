@@ -219,6 +219,8 @@ async function handleApi(request, response, apiPath) {
       await ensureDominoDefaultBrains(connection);
       await connection.beginTransaction();
       for (const item of items) {
+        const id = Number.parseInt(item.id, 10);
+        if (!Number.isInteger(id) || id <= 0) continue;
         const player = clampInteger(item.player, 1, DOMINO_PLAYERS, 1);
         const baseName = sanitizeDominoBrainBase(item.baseName || baseNameFromDominoBrainName(item.nome));
         const nome = `${baseName}J${player}`;
@@ -227,8 +229,8 @@ async function handleApi(request, response, apiPath) {
         await connection.execute(
           `UPDATE JSON_conteudos
              SET json_conteudo = ?, tempo_treino = ?, data_ultima_atualizacao = CURRENT_TIMESTAMP
-           WHERE nome = ?`,
-          [JSON.stringify(brain), tempoTreino, nome]
+           WHERE id = ? AND nome = ?`,
+          [JSON.stringify(brain), tempoTreino, id, nome]
         );
       }
       await connection.commit();
