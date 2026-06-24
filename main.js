@@ -41,11 +41,6 @@ const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 const DOMINO_PLAYERS = 4;
 const DOMINO_INPUT_SIZE = 203;
 const DOMINO_LAYER_SIZES = [DOMINO_INPUT_SIZE, 96, 64, 32, 16, 1];
-const DOMINO_TILE_COUNT = 28;
-const DOMINO_BELIEF_CONTEXT_SIZE = 165;
-const DOMINO_BELIEF_INPUT_SIZE = DOMINO_BELIEF_CONTEXT_SIZE + DOMINO_PLAYERS + DOMINO_TILE_COUNT;
-const DOMINO_BELIEF_LAYER_SIZES = [DOMINO_BELIEF_INPUT_SIZE, 72, 40, 1];
-const DOMINO_BELIEF_CHART_POINT_LIMIT = 200;
 const DOMINO_DEFAULT_BRAIN_BASE = "basico";
 
 function loadLocalEnv() {
@@ -1197,8 +1192,6 @@ function sanitizeDominoBrainBase(value) {
 function createDominoBrain() {
   return {
     layers: createNetworkLayers(DOMINO_LAYER_SIZES),
-    belief: { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
-    beliefStats: createDominoBeliefStats(),
     games: 0,
     roundsTrained: 0,
     treinosRealizados: 0,
@@ -1218,54 +1211,15 @@ function createNetworkLayers(layerSizes) {
   });
 }
 
-function createDominoBeliefStats() {
-  return {
-    trainSteps: 0,
-    examplesSeen: 0,
-    lastLoss: 1,
-    avgLoss: 1,
-    tilePrecision: 0,
-    tileRecall: 0,
-    closeness: 0,
-    chartRoundErrorSum: 0,
-    chartRoundCount: 0,
-    roundErrorHistory: []
-  };
-}
-
 function normalizeDominoBrainForStorage(brain) {
   if (!isValidDominoBrain(brain)) return createDominoBrain();
   const roundsTrained = Number(brain.roundsTrained ?? brain.treinosRealizados) || 0;
-  const validBelief = isValidDominoBeliefNetwork(brain.belief);
   return {
     layers: brain.layers,
-    belief: validBelief ? brain.belief : { layers: createNetworkLayers(DOMINO_BELIEF_LAYER_SIZES) },
-    beliefStats: validBelief ? normalizeDominoBeliefStats(brain.beliefStats) : createDominoBeliefStats(),
     games: Number(brain.games) || 0,
     roundsTrained,
     treinosRealizados: roundsTrained,
     generation: Number(brain.generation) || 0
-  };
-}
-
-function normalizeDominoBeliefStats(stats = {}) {
-  return {
-    trainSteps: Number(stats.trainSteps) || 0,
-    examplesSeen: Number(stats.examplesSeen) || 0,
-    lastLoss: Number.isFinite(Number(stats.lastLoss)) ? Number(stats.lastLoss) : 1,
-    avgLoss: Number.isFinite(Number(stats.avgLoss)) ? Number(stats.avgLoss) : 1,
-    tilePrecision: Number(stats.tilePrecision) || 0,
-    tileRecall: Number(stats.tileRecall) || 0,
-    closeness: Number(stats.closeness) || 0,
-    chartRoundErrorSum: Number(stats.chartRoundErrorSum) || 0,
-    chartRoundCount: Math.max(0, Math.min(19, Number(stats.chartRoundCount) || 0)),
-    roundErrorHistory: Array.isArray(stats.roundErrorHistory)
-      ? stats.roundErrorHistory
-          .map(Number)
-          .filter(Number.isFinite)
-          .map((value) => Math.max(0, Math.min(1, value)))
-          .slice(-DOMINO_BELIEF_CHART_POINT_LIMIT)
-      : []
   };
 }
 
@@ -1277,25 +1231,6 @@ function isValidDominoBrain(brain) {
     brain.layers.every((layer, index) => {
       const outputSize = DOMINO_LAYER_SIZES[index + 1];
       const inputSize = DOMINO_LAYER_SIZES[index];
-      return (
-        Array.isArray(layer.weights) &&
-        layer.weights.length === outputSize &&
-        layer.weights.every((weights) => Array.isArray(weights) && weights.length === inputSize) &&
-        Array.isArray(layer.biases) &&
-        layer.biases.length === outputSize
-      );
-    })
-  );
-}
-
-function isValidDominoBeliefNetwork(network) {
-  return (
-    network &&
-    Array.isArray(network.layers) &&
-    network.layers.length === DOMINO_BELIEF_LAYER_SIZES.length - 1 &&
-    network.layers.every((layer, index) => {
-      const outputSize = DOMINO_BELIEF_LAYER_SIZES[index + 1];
-      const inputSize = DOMINO_BELIEF_LAYER_SIZES[index];
       return (
         Array.isArray(layer.weights) &&
         layer.weights.length === outputSize &&
