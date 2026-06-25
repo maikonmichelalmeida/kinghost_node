@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-23-vocabulary-level-4";
+const DEPLOY_CHECK = "node-2026-06-25-learning-factor";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -704,7 +704,7 @@ async function handleApi(request, response, apiPath) {
     }
     const connection = await openDb();
     const [rows] = await connection.execute(
-      "SELECT palavras_por_dia, narracao_feedback FROM usuario WHERE id = ? LIMIT 1",
+      "SELECT palavras_por_dia, fator_aprendizado, narracao_feedback FROM usuario WHERE id = ? LIMIT 1",
       [userToken.userId]
     );
     await connection.end();
@@ -714,6 +714,7 @@ async function handleApi(request, response, apiPath) {
     }
     sendJson(response, 200, {
       wordsPerDay: Number(rows[0].palavras_por_dia),
+      learningFactor: Number(rows[0].fator_aprendizado) || 10,
       narrationEnabled: Boolean(rows[0].narracao_feedback)
     });
     return;
@@ -727,8 +728,10 @@ async function handleApi(request, response, apiPath) {
     }
     const body = await readJsonBody(request);
     const hasWordsPerDay = Object.prototype.hasOwnProperty.call(body, "wordsPerDay");
+    const hasLearningFactor = Object.prototype.hasOwnProperty.call(body, "learningFactor");
     const hasNarration = Object.prototype.hasOwnProperty.call(body, "narrationEnabled");
     const wordsPerDay = Number(body.wordsPerDay);
+    const learningFactor = Number(body.learningFactor);
     if (hasWordsPerDay && (!Number.isInteger(wordsPerDay) || wordsPerDay < 1 || wordsPerDay > 50)) {
       sendJson(response, 400, { error: "Escolha entre 1 e 50 palavras por nivel." });
       return;
@@ -737,13 +740,17 @@ async function handleApi(request, response, apiPath) {
       sendJson(response, 400, { error: "Preferencia de narracao invalida." });
       return;
     }
-    if (!hasWordsPerDay && !hasNarration) {
+    if (hasLearningFactor && (!Number.isInteger(learningFactor) || learningFactor < 3 || learningFactor > 20)) {
+      sendJson(response, 400, { error: "Escolha um fator de aprendizado entre 3 e 20." });
+      return;
+    }
+    if (!hasWordsPerDay && !hasLearningFactor && !hasNarration) {
       sendJson(response, 400, { error: "Nenhuma preferencia informada." });
       return;
     }
     const connection = await openDb();
     const [rows] = await connection.execute(
-      "SELECT palavras_por_dia, narracao_feedback FROM usuario WHERE id = ? LIMIT 1",
+      "SELECT palavras_por_dia, fator_aprendizado, narracao_feedback FROM usuario WHERE id = ? LIMIT 1",
       [userToken.userId]
     );
     if (!rows.length) {
@@ -752,23 +759,37 @@ async function handleApi(request, response, apiPath) {
       return;
     }
     const nextWordsPerDay = hasWordsPerDay ? wordsPerDay : Number(rows[0].palavras_por_dia);
+    const nextLearningFactor = hasLearningFactor
+      ? learningFactor
+      : Number(rows[0].fator_aprendizado) || 10;
     const nextNarration = hasNarration ? body.narrationEnabled : Boolean(rows[0].narracao_feedback);
     const wordsChanged = nextWordsPerDay !== Number(rows[0].palavras_por_dia);
+    const factorChanged = nextLearningFactor !== (Number(rows[0].fator_aprendizado) || 10);
+    const trainingChanged = wordsChanged || factorChanged;
     await connection.execute(
       `UPDATE usuario
       SET palavras_por_dia = ?,
+        fator_aprendizado = ?,
         narracao_feedback = ?,
         contexto_vocabulario_json = CASE WHEN ? THEN NULL ELSE contexto_vocabulario_json END,
         data_ultimo_treino = CASE WHEN ? THEN '2000-01-01 00:00:00' ELSE data_ultimo_treino END
       WHERE id = ?`,
-      [nextWordsPerDay, nextNarration ? 1 : 0, wordsChanged ? 1 : 0, wordsChanged ? 1 : 0, userToken.userId]
+      [
+        nextWordsPerDay,
+        nextLearningFactor,
+        nextNarration ? 1 : 0,
+        trainingChanged ? 1 : 0,
+        trainingChanged ? 1 : 0,
+        userToken.userId
+      ]
     );
     await connection.end();
     sendJson(response, 200, {
       ok: true,
       wordsPerDay: nextWordsPerDay,
+      learningFactor: nextLearningFactor,
       narrationEnabled: nextNarration,
-      trainingReset: wordsChanged
+      trainingReset: trainingChanged
     });
     return;
   }
@@ -1066,10 +1087,21 @@ async function ensureTable() {
   `);
   await connection.execute(`
     ALTER TABLE usuario
+      DROP COLUMN IF EXISTS treinar_narracao,
       ADD COLUMN IF NOT EXISTS palavras_por_dia SMALLINT UNSIGNED NOT NULL DEFAULT 5,
+      ADD COLUMN IF NOT EXISTS fator_aprendizado SMALLINT UNSIGNED NOT NULL DEFAULT 10,
       ADD COLUMN IF NOT EXISTS data_ultimo_treino DATETIME NOT NULL DEFAULT '2000-01-01 00:00:00',
       ADD COLUMN IF NOT EXISTS contexto_vocabulario_json LONGTEXT NULL,
       ADD COLUMN IF NOT EXISTS narracao_feedback TINYINT(1) NOT NULL DEFAULT 1
+  `);
+  await connection.execute(`
+    ALTER TABLE usuario
+      DROP CONSTRAINT IF EXISTS chk_usuario_fator_aprendizado
+  `);
+  await connection.execute(`
+    ALTER TABLE usuario
+      ADD CONSTRAINT chk_usuario_fator_aprendizado
+      CHECK (fator_aprendizado BETWEEN 3 AND 20)
   `);
   await connection.execute(`
     ALTER TABLE exemplo
@@ -1685,15 +1717,15 @@ const VOCABULARY_TRAINING_VERSION = 8;
 const VOCABULARY_TRAINING_INTERVAL_MS = 23 * 60 * 60 * 1000;
 const VOCABULARY_GRADUATED_LEVEL = 4;
 const LEVEL_RULES = [
-  { waitMs: 0, exampleCount: 10, maxDelta: 10 },
-  { waitMs: 23 * 60 * 60 * 1000, exampleCount: 7, maxDelta: 20 },
-  { waitMs: 7 * 24 * 60 * 60 * 1000, exampleCount: 5, maxDelta: 30 },
-  { waitMs: 25 * 24 * 60 * 60 * 1000, exampleCount: 4, maxDelta: 40 }
+  { waitMs: 0, baseExampleCount: 10 },
+  { waitMs: 23 * 60 * 60 * 1000, baseExampleCount: 7 },
+  { waitMs: 7 * 24 * 60 * 60 * 1000, baseExampleCount: 5 },
+  { waitMs: 25 * 24 * 60 * 60 * 1000, baseExampleCount: 4 }
 ];
 
 async function getOrBuildVocabularyTraining(connection, userId) {
   const [userRows] = await connection.execute(
-    `SELECT id, palavras_por_dia, data_ultimo_treino, contexto_vocabulario_json
+    `SELECT id, palavras_por_dia, fator_aprendizado, data_ultimo_treino, contexto_vocabulario_json
     FROM usuario WHERE id = ? LIMIT 1 FOR UPDATE`,
     [userId]
   );
@@ -1704,17 +1736,30 @@ async function getOrBuildVocabularyTraining(connection, userId) {
   }
 
   const user = userRows[0];
+  const learningFactor = normalizeLearningFactor(user.fator_aprendizado);
   const saved = parseUserContext(user.contexto_vocabulario_json);
   const lastBuild = new Date(user.data_ultimo_treino || 0).getTime();
   const canBuildAgain = !Number.isFinite(lastBuild) || Date.now() - lastBuild >= VOCABULARY_TRAINING_INTERVAL_MS;
-  if (saved?.version === VOCABULARY_TRAINING_VERSION && saved.status === "active") {
+  const savedLearningFactor = normalizeLearningFactor(saved?.learningFactor);
+  const matchesLearningFactor = savedLearningFactor === learningFactor;
+  if (saved?.version === VOCABULARY_TRAINING_VERSION && saved.status === "active" && matchesLearningFactor) {
     return saved;
   }
-  if (saved?.version === VOCABULARY_TRAINING_VERSION && saved.status !== "empty" && !canBuildAgain) {
+  if (
+    saved?.version === VOCABULARY_TRAINING_VERSION &&
+    saved.status !== "empty" &&
+    !canBuildAgain &&
+    matchesLearningFactor
+  ) {
     return saved;
   }
 
-  const training = await buildVocabularyTraining(connection, userId, Math.max(1, Number(user.palavras_por_dia) || 5));
+  const training = await buildVocabularyTraining(
+    connection,
+    userId,
+    Math.max(1, Number(user.palavras_por_dia) || 5),
+    learningFactor
+  );
   await saveVocabularyTraining(connection, userId, training);
   await connection.execute(
     "UPDATE usuario SET data_ultimo_treino = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1723,7 +1768,7 @@ async function getOrBuildVocabularyTraining(connection, userId) {
   return training;
 }
 
-async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
+async function buildVocabularyTraining(connection, userId, wordsPerLevel, learningFactor) {
   const now = new Date();
   const [studyRows] = await connection.execute(
     `SELECT ep.vocabulario_id, ep.nivel, ep.score, ep.created_at, ep.ultima_revisao,
@@ -1762,7 +1807,7 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
 
   const selected = [];
   for (let level = 0; level < LEVEL_RULES.length; level += 1) {
-    const rule = LEVEL_RULES[level];
+    const rule = getLevelRule(level, learningFactor);
     const eligible = studyRows.filter((word) => {
       if (Number(word.nivel) !== level) return false;
       if (!rule.waitMs) return true;
@@ -1775,7 +1820,7 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
   const groups = [];
   for (const word of selected) {
     const level = Number(word.nivel);
-    const rule = LEVEL_RULES[level];
+    const rule = getLevelRule(level, learningFactor);
     const [exampleRows] = await connection.execute(
       `SELECT id, texto, traducao, resposta
       FROM exemplo
@@ -1844,8 +1889,27 @@ async function buildVocabularyTraining(connection, userId, wordsPerLevel) {
     status: exercises.length ? "active" : "empty",
     currentIndex: 0,
     wordsPerLevel,
+    learningFactor,
     words: shuffledGroups.map((group) => group.word),
     exercises
+  };
+}
+
+function normalizeLearningFactor(value) {
+  const factor = Number(value);
+  return Number.isInteger(factor) && factor >= 3 && factor <= 20 ? factor : 10;
+}
+
+function getLevelRule(level, learningFactor) {
+  const baseRule = LEVEL_RULES[level] || LEVEL_RULES[0];
+  const factor = normalizeLearningFactor(learningFactor);
+  return {
+    waitMs: baseRule.waitMs,
+    exampleCount: Math.max(
+      1,
+      Math.min(10, Math.round(baseRule.baseExampleCount * factor / 10))
+    ),
+    maxDelta: Math.ceil(100 / factor) * (level + 1)
   };
 }
 
