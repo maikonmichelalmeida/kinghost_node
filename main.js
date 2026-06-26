@@ -7,7 +7,7 @@ const path = require("path");
 
 loadLocalEnv();
 
-const DEPLOY_CHECK = "node-2026-06-25-learning-factor";
+const DEPLOY_CHECK = "node-2026-06-26-painel-esp";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
 const contentTypes = {
@@ -575,6 +575,32 @@ async function handleApi(request, response, apiPath) {
     return;
   }
 
+  if (apiPath === "/api/painel/temperature" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    const temperature = normalizePanelTemperature(body.temperature ?? body.temperatura);
+    if (temperature === null) {
+      sendJson(response, 400, { error: "Temperatura invalida." });
+      return;
+    }
+
+    const connection = await openDb();
+    try {
+      await savePanelTemperature(connection, temperature);
+      const config = await readPanelConfig(connection);
+      const state = await readPanelState(connection);
+      sendJson(response, 200, {
+        ok: true,
+        tempoLeitura: config.tempoLeitura,
+        pointDown: config.pointDown,
+        pointUp: config.pointUp,
+        state
+      });
+      return;
+    } finally {
+      await connection.end();
+    }
+  }
+
   const isUserTrainingRoute = apiPath === "/api/user/vocabulary-training" ||
     apiPath === "/api/user/vocabulary-training/answer" ||
     apiPath === "/api/user/vocabulary-training/reveal" ||
@@ -588,6 +614,35 @@ async function handleApi(request, response, apiPath) {
   if (apiPath === "/api/session" && request.method === "GET") {
     sendJson(response, 200, { ok: true, exp: tokenPayload.exp });
     return;
+  }
+
+  if (apiPath === "/api/painel/state" && request.method === "GET") {
+    const connection = await openDb();
+    try {
+      sendJson(response, 200, await readPanelState(connection));
+      return;
+    } finally {
+      await connection.end();
+    }
+  }
+
+  if (apiPath === "/api/painel/settings" && request.method === "PUT") {
+    const body = await readJsonBody(request);
+    const connection = await openDb();
+    try {
+      const config = await updatePanelConfig(connection, body);
+      sendJson(response, 200, { ok: true, config });
+      return;
+    } catch (error) {
+      const status = Number(error.statusCode || 500);
+      if (status < 500) {
+        sendJson(response, status, { error: error.message });
+        return;
+      }
+      throw error;
+    } finally {
+      await connection.end();
+    }
   }
 
   if (apiPath === "/api/vocabulary/pending" && request.method === "GET") {
@@ -1072,6 +1127,37 @@ async function ensureTable() {
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
   `);
   await connection.execute(`
+    CREATE TABLE IF NOT EXISTS inteiros (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      nome VARCHAR(80) NOT NULL,
+      valor_int INT NULL,
+      valor_float DOUBLE NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_inteiros_nome (nome)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+  `);
+  await connection.execute(`
+    INSERT INTO inteiros (nome, valor_int, valor_float)
+    VALUES
+      ('tempo_leitura', 10, NULL),
+      ('point_down', NULL, 10),
+      ('point_up', NULL, 30)
+    ON DUPLICATE KEY UPDATE nome = VALUES(nome)
+  `);
+  await connection.execute(`
+    CREATE TABLE IF NOT EXISTS painel_temperatura (
+      id TINYINT UNSIGNED PRIMARY KEY,
+      temperatura_c DOUBLE NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+  `);
+  await connection.execute(`
+    INSERT INTO painel_temperatura (id, temperatura_c)
+    VALUES (1, NULL)
+    ON DUPLICATE KEY UPDATE id = VALUES(id)
+  `);
+  await connection.execute(`
     CREATE TABLE IF NOT EXISTS derivados (
       id INT AUTO_INCREMENT PRIMARY KEY,
       derivado VARCHAR(255) NOT NULL,
@@ -1341,6 +1427,100 @@ function formatLeituraRow(row) {
     json_content: row.json_content,
     content
   };
+}
+
+async function readPanelState(connection) {
+  const config = await readPanelConfig(connection);
+  const [rows] = await connection.execute(
+    `SELECT temperatura_c, updated_at
+    FROM painel_temperatura
+    WHERE id = 1
+    LIMIT 1`
+  );
+  const temperature = rows[0] || {};
+  return {
+    config,
+    temperature: temperature.temperatura_c === null || temperature.temperatura_c === undefined
+      ? null
+      : Number(temperature.temperatura_c),
+    temperatureUpdatedAt: temperature.updated_at || null
+  };
+}
+
+async function readPanelConfig(connection) {
+  const [rows] = await connection.query(
+    "SELECT nome, valor_int, valor_float FROM inteiros WHERE nome IN ('tempo_leitura', 'point_down', 'point_up')"
+  );
+  const byName = Object.fromEntries(rows.map((row) => [row.nome, row]));
+  return {
+    tempoLeitura: normalizePanelReadSeconds(byName.tempo_leitura?.valor_int),
+    pointDown: normalizePanelPoint(byName.point_down?.valor_float, 10),
+    pointUp: normalizePanelPoint(byName.point_up?.valor_float, 30)
+  };
+}
+
+async function updatePanelConfig(connection, body) {
+  const current = await readPanelConfig(connection);
+  const next = { ...current };
+  if (Object.prototype.hasOwnProperty.call(body, "tempoLeitura")) {
+    next.tempoLeitura = normalizePanelReadSeconds(body.tempoLeitura);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "pointDown")) {
+    next.pointDown = normalizePanelPoint(body.pointDown, current.pointDown);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "pointUp")) {
+    next.pointUp = normalizePanelPoint(body.pointUp, current.pointUp);
+  }
+  if (next.pointDown >= next.pointUp) {
+    const error = new Error("point_down precisa ser menor que point_up.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  await upsertPanelInteger(connection, "tempo_leitura", next.tempoLeitura, null);
+  await upsertPanelInteger(connection, "point_down", null, next.pointDown);
+  await upsertPanelInteger(connection, "point_up", null, next.pointUp);
+  return next;
+}
+
+async function upsertPanelInteger(connection, name, integerValue, floatValue) {
+  await connection.execute(
+    `INSERT INTO inteiros (nome, valor_int, valor_float)
+    VALUES (?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      valor_int = VALUES(valor_int),
+      valor_float = VALUES(valor_float)`,
+    [name, integerValue, floatValue]
+  );
+}
+
+async function savePanelTemperature(connection, temperature) {
+  await connection.execute(
+    `INSERT INTO painel_temperatura (id, temperatura_c)
+    VALUES (1, ?)
+    ON DUPLICATE KEY UPDATE
+      temperatura_c = VALUES(temperatura_c),
+      updated_at = CURRENT_TIMESTAMP`,
+    [temperature]
+  );
+}
+
+function normalizePanelTemperature(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < -100 || number > 1000) return null;
+  return Math.round(number * 10) / 10;
+}
+
+function normalizePanelReadSeconds(value) {
+  const seconds = Number.parseInt(value, 10);
+  if (!Number.isFinite(seconds)) return 10;
+  return Math.max(1, Math.min(86400, seconds));
+}
+
+function normalizePanelPoint(value, fallback) {
+  const point = Number(value);
+  if (!Number.isFinite(point)) return fallback;
+  return Math.round(Math.max(-100, Math.min(1000, point)) * 10) / 10;
 }
 
 function parseUserContext(value) {
