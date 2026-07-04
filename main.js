@@ -143,7 +143,15 @@ async function handleApi(request, response, apiPath) {
     try {
       const row = await readProjectJsonRow(connection, nome);
       if (!row) {
-        sendJson(response, 404, { error: "JSON do projeto nao encontrado." });
+        const emptyProjectJson = { version: 4, settings: null, training: null, eliteBrains: [] };
+        await upsertProjectJsonRow(connection, nome, JSON.stringify(emptyProjectJson), 0);
+        sendJson(response, 200, {
+          nome,
+          json: emptyProjectJson,
+          dataUltimaAtualizacao: null,
+          dataInclusao: null,
+          tempoTreino: 0
+        });
         return;
       }
       sendJson(response, 200, {
