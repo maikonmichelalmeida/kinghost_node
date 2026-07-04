@@ -136,6 +136,61 @@ async function handleApi(request, response, apiPath) {
     return;
   }
 
+  const projectJsonMatch = apiPath.match(/^\/api\/project-json\/([^/]+)$/);
+  if (projectJsonMatch && request.method === "GET") {
+    const nome = sanitizeProjectJsonName(decodeURIComponent(projectJsonMatch[1]));
+    const connection = await openDb();
+    try {
+      const row = await readProjectJsonRow(connection, nome);
+      if (!row) {
+        sendJson(response, 404, { error: "JSON do projeto nao encontrado." });
+        return;
+      }
+      sendJson(response, 200, {
+        nome: row.nome,
+        json: parseStoredProjectJson(row.json_conteudo),
+        dataUltimaAtualizacao: row.data_ultima_atualizacao,
+        dataInclusao: row.data_inclusao,
+        tempoTreino: Number(row.tempo_treino) || 0
+      });
+    } finally {
+      await connection.end();
+    }
+    return;
+  }
+
+  if (projectJsonMatch && (request.method === "PUT" || request.method === "POST")) {
+    const nome = sanitizeProjectJsonName(decodeURIComponent(projectJsonMatch[1]));
+    const body = await readJsonBody(request);
+    const payload = body && Object.prototype.hasOwnProperty.call(body, "json") ? body.json : body;
+    const tempoTreino = Math.max(0, Number.parseInt(body?.tempoTreino, 10) || 0);
+    const jsonText = JSON.stringify(payload ?? null);
+    if (jsonText.length > 8_000_000) {
+      sendJson(response, 413, { error: "JSON grande demais." });
+      return;
+    }
+    const connection = await openDb();
+    try {
+      await upsertProjectJsonRow(connection, nome, jsonText, tempoTreino);
+      sendJson(response, 200, { ok: true, nome });
+    } finally {
+      await connection.end();
+    }
+    return;
+  }
+
+  if (projectJsonMatch && request.method === "DELETE") {
+    const nome = sanitizeProjectJsonName(decodeURIComponent(projectJsonMatch[1]));
+    const connection = await openDb();
+    try {
+      const [result] = await connection.execute("DELETE FROM JSON_conteudos WHERE nome = ?", [nome]);
+      sendJson(response, 200, { ok: true, nome, deleted: result.affectedRows });
+    } finally {
+      await connection.end();
+    }
+    return;
+  }
+
   if (apiPath === "/api/domino/brains" && request.method === "GET") {
     const connection = await openDb();
     try {
@@ -1241,6 +1296,42 @@ async function insertDominoBrain(connection, nome, brain, tempoTreino) {
      VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
     [nome, JSON.stringify(brain), tempoTreino]
   );
+}
+
+function sanitizeProjectJsonName(value) {
+  const name = String(value || "").trim();
+  if (!/^[a-zA-Z0-9_.:-]{1,120}$/.test(name)) {
+    throw new Error("Nome de JSON de projeto invalido.");
+  }
+  return name;
+}
+
+async function readProjectJsonRow(connection, nome) {
+  const [rows] = await connection.execute(
+    "SELECT id, nome, json_conteudo, data_ultima_atualizacao, data_inclusao, tempo_treino FROM JSON_conteudos WHERE nome = ? LIMIT 1",
+    [nome]
+  );
+  return rows[0] || null;
+}
+
+async function upsertProjectJsonRow(connection, nome, jsonText, tempoTreino) {
+  await connection.execute(
+    `INSERT INTO JSON_conteudos (nome, json_conteudo, tempo_treino, data_ultima_atualizacao, data_inclusao)
+     VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON DUPLICATE KEY UPDATE
+       json_conteudo = VALUES(json_conteudo),
+       tempo_treino = VALUES(tempo_treino),
+       data_ultima_atualizacao = CURRENT_TIMESTAMP`,
+    [nome, jsonText, tempoTreino]
+  );
+}
+
+function parseStoredProjectJson(jsonText) {
+  try {
+    return JSON.parse(String(jsonText || "null"));
+  } catch {
+    return null;
+  }
 }
 
 function dominoBrainOptions(rows) {
