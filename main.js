@@ -1635,11 +1635,22 @@ function parseUserContext(value) {
 }
 
 function normalizeVocabularyWriting(value) {
-  return String(value || "")
+  const text = String(value || "")
     .normalize("NFKC")
-    .trim()
+    .toLocaleLowerCase("en-US")
+    .replace(/[^\p{L}\p{N}*\s]/gu, " ")
     .replace(/\s*\*\s*/g, " * ")
-    .replace(/\s+/g, " ");
+    .replace(/\s+/g, " ")
+    .trim();
+  const tokens = text.split(" ").filter(Boolean);
+  const normalizedTokens = [];
+  tokens.forEach((token) => {
+    if (token === "*" && normalizedTokens[normalizedTokens.length - 1] === "*") {
+      return;
+    }
+    normalizedTokens.push(token);
+  });
+  return normalizedTokens.join(" ");
 }
 
 async function resolveVocabularyForStudy(connection, requestedWriting) {
