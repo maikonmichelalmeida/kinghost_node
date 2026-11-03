@@ -25,13 +25,21 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   const submit={quoteId:q.data.id,prices:[1234]};const [r1,r2]=await Promise.all([request('/orders',submit,client),request('/orders',submit,client)]);
   assert.equal(r1.status,201);assert.equal(r1.data.id,r2.data.id);assert.equal(r1.data.totalCents,1234);assert.equal(r1.data.stops[0].suggestedCents,700);assert.equal(r1.data.status,'scheduled');
   const id=r1.data.id;
+  // A conta do entregador deve enxergar imediatamente a encomenda criada pela farmácia.
+  const pendingDriver=(await request('/state',undefined,driver));
+  assert.equal(pendingDriver.status,200);
+  assert.equal(pendingDriver.data.orders.find(o=>o.id===id)?.status,'scheduled');
   assert.equal((await request(`/orders/${id}/action`,{action:'start'},driver)).status,409);
   clock=Date.parse('2026-11-03T10:00:00-03:00');await service.maintain();
   let s=(await request('/state',undefined,client)).data;assert.equal(s.availability.open,true);assert.equal(s.orders.length,1);assert.equal(s.orders[0].status,'accepted');
+  const acceptedDriver=(await request('/state',undefined,driver)).data;
+  assert.equal(acceptedDriver.orders.find(o=>o.id===id)?.status,'accepted');
   assert.equal((await request(`/orders/${id}/action`,{action:'seen'},client)).status,403);
   await request(`/orders/${id}/action`,{action:'seen'},driver);
+  assert.equal((await request('/state',undefined,client)).data.orders.find(o=>o.id===id)?.status,'seen');
   await request(`/orders/${id}/action`,{action:'delay',minutes:10},driver);
   assert.equal((await request(`/orders/${id}/action`,{action:'start'},driver)).status,200);
+  assert.equal((await request('/state',undefined,client)).data.orders.find(o=>o.id===id)?.status,'running');
   assert.equal((await request(`/orders/${id}/action`,{action:'finish'},driver)).status,409);
   clock=Date.parse('2026-11-03T20:30:00-03:00');
   assert.equal((await request('/quote',{stops},client)).status,409);
