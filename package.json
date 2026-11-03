@@ -3,7 +3,9 @@
   "private": true,
   "main": "main.js",
   "scripts": {
-    "start": "node main.js"
+    "start": "node main.js",
+    "test:entregas": "node --test entregas/*.test.js",
+    "setup:entregas": "node entregas/setup.js"
   },
   "dependencies": {
     "mysql2": "^3.11.5"

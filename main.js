@@ -7,6 +7,8 @@ const path = require("path");
 
 loadLocalEnv();
 
+const deliveries = require("./entregas/service").createService({ openDb });
+
 const DEPLOY_CHECK = "node-2026-06-26-painel-esp";
 const port = Number(process.env.PORT || process.env.NODE_PORT || process.argv[2] || 21106);
 const staticRoot = findStaticRoot();
@@ -93,6 +95,10 @@ function requiredEnv(name) {
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, "http://localhost");
+    if (url.pathname.startsWith("/api/entregas/")) {
+      await deliveries.handle(request, response, url);
+      return;
+    }
     const apiPath = getApiPath(url.pathname);
 
     if (apiPath) {
@@ -114,6 +120,7 @@ const server = http.createServer(async (request, response) => {
 start();
 
 async function start() {
+  deliveries.start();
   try {
     await ensureTable();
   } catch (error) {
@@ -1044,6 +1051,8 @@ function getApiPath(pathname) {
 }
 
 function findStaticRoot() {
+  const webRoot = path.resolve(__dirname, "..", "www");
+  if (fs.existsSync(path.join(webRoot, "index.html"))) return webRoot;
   const candidates = [
     path.resolve(__dirname, "..", "www", "domino"),
     path.join(__dirname, "outputs"),
