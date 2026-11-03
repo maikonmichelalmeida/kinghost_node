@@ -1,4 +1,4 @@
-//Maikon Michel, 2027
+//Maikon Michel, 2026
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
