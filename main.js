@@ -156,7 +156,7 @@ async function handleApi(request, response, apiPath) {
   }
 
   return;
-}
+} 
   if (request.method === "OPTIONS") {
     sendJson(response, 200, { ok: true });
     return;
