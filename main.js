@@ -133,6 +133,30 @@ async function start() {
 }
 
 async function handleApi(request, response, apiPath) {
+  if (apiPath === "/api/whatsapp/webhook" &&
+    request.method === "GET") {
+
+  const url = new URL(request.url, "http://localhost");
+
+  const mode = url.searchParams.get("hub.mode");
+  const token = url.searchParams.get("hub.verify_token");
+  const challenge = url.searchParams.get("hub.challenge");
+
+  const expectedToken = process.env.WHATSAPP_VERIFY_TOKEN;
+
+  if (
+    expectedToken &&
+    mode === "subscribe" &&
+    token === expectedToken &&
+    challenge !== null
+  ) {
+    sendText(response, 200, challenge);
+  } else {
+    sendText(response, 403, "Verificacao recusada");
+  }
+
+  return;
+}
   if (request.method === "OPTIONS") {
     sendJson(response, 200, { ok: true });
     return;
