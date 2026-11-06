@@ -8,7 +8,7 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
  const dir=path.join(__dirname,'../../work');fs.mkdirSync(dir,{recursive:true});const seed=path.join(dir,prefix+'accounts.json');
  fs.writeFileSync(seed,JSON.stringify(['driver','client'].map(role=>{const salt=crypto.randomBytes(16).toString('hex');return{username:role+'-test',role,passwordHash:salt+':'+crypto.scryptSync('test-only-password',salt,64).toString('hex')}})));
  let clock=Date.parse('2026-11-03T09:00:00-03:00');const originalKey=process.env.GOOGLE_ROUTES_API_KEY;process.env.GOOGLE_ROUTES_API_KEY='fake-test-key';process.env.GOOGLE_PLACES_API_KEY='fake-test-key';
- let calls=0,simulateFailure=false;const service=createService({openDb,seedFile:seed,now:()=>clock,monitorProvider:async()=>({counts:{routes:0,autocomplete:0,details:0,geocode:0},cutoff:clock-3600000}),fetchImpl:async(url,options)=>{
+ let calls=0,alerts=0,simulateFailure=false;const service=createService({openDb,seedFile:seed,now:()=>clock,announceNewOrder:async()=>{alerts++;throw new Error("simulated voice outage");},monitorProvider:async()=>({counts:{routes:0,autocomplete:0,details:0,geocode:0},cutoff:clock-3600000}),fetchImpl:async(url,options)=>{
   calls++;if(simulateFailure)throw new Error('mock timeout');
   const b=options.body?JSON.parse(options.body):{};
   if(String(url).includes('/places/'))return {ok:true,json:async()=>({id:'place-test',formattedAddress:'Rua Teste, 1, Gravataí',location:{latitude:-29.95,longitude:-50.98},addressComponents:[{types:['street_number'],longText:'1'}]})};
@@ -63,7 +63,10 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   const history=(await request('/history?day=2026-11-03',undefined,client)).data;assert.equal(history.items.length,1);assert.equal(history.items[0].priceCents,1234);assert.equal(history.orders.length,1);assert.equal(history.orders[0].status,'done');assert.equal(history.orders[0].totalCents,1234);
   assert.equal((await request('/state',undefined,client)).data.orders.length,0);
   clock=Date.parse('2026-11-04T12:00:00-03:00');await request('/availability',{action:'open'},driver);
-  simulateFailure=true;const failed=await request('/orders',{submissionId:crypto.randomUUID(),stops:[{address:'Rua Teste, 123, Gravataí',priceCents:700},{address:'Rua Teste, 124, Gravataí',priceCents:700}]},client);
+  assert.equal(alerts,0); // Scheduled orders and their later promotion stay silent.
+  simulateFailure=true;const liveSubmission={submissionId:crypto.randomUUID(),stops:[{address:'Rua Teste, 123, Gravataí',priceCents:700},{address:'Rua Teste, 124, Gravataí',priceCents:700}]};
+  const failed=await request('/orders',liveSubmission,client);
+  const repeated=await request('/orders',liveSubmission,client);assert.equal(repeated.data.id,failed.data.id);assert.equal(alerts,1);
   assert.equal(failed.status,201);assert.equal(failed.data.routeStatus,'pending');assert.equal(failed.data.route,null);
   assert.equal((await request('/state',undefined,driver)).data.orders.some(o=>o.id===failed.data.id),true);
   // A simultaneous burst reserves at most the configured 20 routes per minute.

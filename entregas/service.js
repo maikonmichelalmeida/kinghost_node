@@ -10,7 +10,7 @@ const json = value => typeof value === 'string' ? JSON.parse(value) : value;
 const fail = (status, message) => { const e = new Error(message); e.status = status; throw e; };
 const text = (s, max = 300) => String(s ?? '').trim().slice(0, max);
 const terminal = o => ['done', 'cancelled'].includes(o.status);
-function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, seedFile = path.join(__dirname, 'accounts.local.json') }) {
+function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, announceNewOrder, seedFile = path.join(__dirname, 'accounts.local.json') }) {
   let initPromise;
   let timer, lastMaintenance=0;
   const listeners=new Set();
@@ -19,7 +19,7 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, see
   const limits = new Map();
   const budget = require('./google-budget').createBudget({openDb,now,fetchImpl,monitorProvider});
   const google = require('./google-client').createGoogle({budget,fetchImpl});
-  const workflow = require('./google-workflow').createWorkflow({db,transaction,storeOrder,google,budget,now});
+  const workflow = require('./google-workflow').createWorkflow({db,transaction,storeOrder,google,budget,now,announceNewOrder});
   async function db(fn) { const c = await openDb(); try { return await fn(c); } finally { await c.end(); } }
   async function initialize() {
     if (initPromise) return initPromise;

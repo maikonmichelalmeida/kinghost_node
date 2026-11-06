@@ -14,6 +14,7 @@ function createWorkflow({
   storeOrder,
   google,
   budget,
+  announceNewOrder = require("./voice-monkey").announceNewOrder,
   now = Date.now,
 }) {
   async function initialize(c) {
@@ -290,7 +291,7 @@ function createWorkflow({
           "INSERT INTO delivery_submissions (id,signature,order_id) VALUES (?,?,?)",
           [key, signature, o.id],
         );
-        return { id: o.id };
+        return { id: o.id, alertUntil: av.open ? s.openUntil : 0 };
       });
       // A retry of the HTTP submission never creates another billable optimization.
       if (saved.duplicate) {
@@ -300,6 +301,11 @@ function createWorkflow({
           ]),
         );
         return decorate(parse(rows[0].payload));
+      }
+      if (saved.alertUntil > now()) {
+        void announceNewOrder().catch(() => {
+          console.warn("Entregas: aviso de voz sem confirmação para", saved.id);
+        });
       }
       return optimize(saved.id, u);
     }
