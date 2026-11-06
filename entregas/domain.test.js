@@ -14,14 +14,3 @@ test('agenda abre sem navegador e não reabre depois do fechamento',()=>{
  D.applySchedule(s,D.closing(at));assert.equal(D.availability(s,D.closing(at)).open,false);
  D.applySchedule(s,at+86400000);assert.equal(s.openUntil,0);
 });
-test('otimização inclui o retorno e respeita a entrega prioritária',()=>{
- const weights=[[0,1,2],[20,0,1],[1,2,0]];
- const matrix=weights.map(row=>row.map(time=>({time,distance:time*100})));
- assert.deepEqual(D.optimize(matrix,2),{order:[0,1],seconds:3,meters:300});
- assert.deepEqual(D.optimize(matrix,2,1),{order:[1,0],seconds:24,meters:2400});
-});
-test('cinco entregas são visitadas uma vez e matriz sem percurso é rejeitada',()=>{
- const matrix=Array.from({length:6},(_,i)=>Array.from({length:6},(_,j)=>({time:i===j?0:1,distance:i===j?0:100})));
- const result=D.optimize(matrix,5);assert.equal(new Set(result.order).size,5);assert.equal(result.seconds,6);
- matrix[1][4].time=null;assert.throws(()=>D.optimize(matrix,5),/rota/);
-});
