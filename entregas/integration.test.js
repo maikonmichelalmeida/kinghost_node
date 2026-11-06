@@ -80,7 +80,10 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   assert.equal((await request('/state',undefined,client)).data.orders.length,0);
   clock=Date.parse('2026-11-04T12:00:00-03:00');await request('/availability',{action:'open'},driver);
   assert.equal(alerts,0); // Scheduled orders and their later promotion stay silent.
-  simulateFailure=true;const liveSubmission={submissionId:crypto.randomUUID(),stops:[{address:'Rua Teste, 123, Gravataí',priceCents:700},{address:'Rua Teste, 124, Gravataí',priceCents:700}]};
+  const resolveTest=async(token,id)=> (await request('/resolve',{placeId:id,address:'Rua Teste, 1, Gravataí',purpose:'correction',session:crypto.randomUUID(),operationId:crypto.randomUUID()},token)).data.selectionId;
+  const selectionId=await resolveTest(client,'client-place');assert.ok(selectionId);
+  const liveSubmission={submissionId:crypto.randomUUID(),stops:[{selectionId,priceCents:700},{selectionId,priceCents:700}]};
+  simulateFailure=true;
   const failed=await request('/orders',liveSubmission,client);
   const repeated=await request('/orders',liveSubmission,client);assert.equal(repeated.data.id,failed.data.id);assert.equal(alerts,1);
   assert.equal(failed.status,201);assert.equal(failed.data.routeStatus,'pending');assert.equal(failed.data.route,null);
@@ -103,7 +106,7 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   for(let attempt=0;attempt<2;attempt++){const started=await request(startPath,{action:'start'},driver);assert.equal(started.status,200);assert.ok(started.data.navigation[0].url);}
   // A single link can finish immediately; finishing marks all its stops.
   const finished=(await request(startPath,{action:'finish'},driver));assert.equal(finished.status,200);assert.equal(finished.data.delivered.length,2);
-  const multi=await request('/orders',{submissionId:crypto.randomUUID(),stops:Array.from({length:8},(_,i)=>({address:`Rua Teste, ${100+i}, Gravataí`,priceCents:700}))},client);
+  const multi=await request('/orders',{submissionId:crypto.randomUUID(),stops:Array.from({length:8},(_,i)=>({selectionId,priceCents:700}))},client);
   const partPath=`/orders/${multi.data.id}/action`,started=(await request(partPath,{action:'start'},driver)).data;
   assert.equal(started.part.total,3);const indices=started.part.indices;const index=indices[2];
   const check={action:'delivered',index,checked:true};assert.equal((await request(partPath,check,client)).status,403);
@@ -118,6 +121,16 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   assert.equal((await request(partPath,{...check,checked:false},driver)).status,409);
   const last=(await request(partPath,{action:'advance',part:2},driver)).data;assert.equal(last.part.number,3);assert.equal(last.delivered.length,8);assert.equal(last.navigation[0].returnsHome,true);
   assert.equal((await request(partPath,{action:'finish'},driver)).data.status,'done');
+  const mixed={submissionId:crypto.randomUUID(),priority:1,stops:[{selectionId,priceCents:700},{address:'Estrada sem placa',priceCents:810,allowUnresolved:true},{address:'Portão norte',priceCents:930,allowUnresolved:true}]};
+  const beforeMaps=calls,review=await request('/orders',mixed,client);assert.equal(review.status,201);assert.equal(review.data.routeStatus,'awaiting_address');assert.equal(review.data.route,null);assert.equal(calls,beforeMaps);
+  const pendingPath=`/orders/${review.data.id}`;
+  assert.equal((await request(pendingPath+'/route',{},driver)).status,409);assert.equal((await request(pendingPath+'/action',{action:'start'},driver)).status,409);
+  const approved=await resolveTest(driver,'driver-place');const fix={index:1,selectionId:approved};
+  assert.equal((await request(pendingPath+'/correct',fix,client)).status,403);
+  assert.equal((await request(pendingPath+'/correct',{index:1,selectionId},driver)).status,409);
+  const afterLookup=calls;const firstFix=await request(pendingPath+'/correct',fix,driver);assert.equal(firstFix.status,200);assert.equal(firstFix.data.routeStatus,'awaiting_address');assert.equal(calls,afterLookup);
+  const lastFix=await request(pendingPath+'/correct',{...fix,index:2},driver);assert.equal(lastFix.status,200);assert.equal(lastFix.data.routeStatus,'ready');assert.equal(lastFix.data.route.order[0],1);assert.equal(lastFix.data.totalCents,2440);assert.ok(lastFix.data.navigation[0].url.includes('google.com/maps'));
+  assert.equal((await request(pendingPath+'/correct',fix,driver)).status,409);
   // A simultaneous burst reserves at most the configured 20 routes per minute.
   clock+=60000;let executions=0;
   const burst=await Promise.allSettled(Array.from({length:30},(_,i)=>service.budget.call('routes','burst-'+i,{i},async()=>{executions++;return {ok:true};})));

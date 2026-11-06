@@ -202,7 +202,7 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
         });
         reply(200,{ok:true}); return;
       }
-      if (req.method === 'POST' && (['/autocomplete','/resolve','/google-base','/orders'].includes(route) || /^\/orders\/[a-f0-9-]{36}\/route$/.test(route))) {
+      if (req.method === 'POST' && (['/autocomplete','/resolve','/google-base','/orders'].includes(route) || /^\/orders\/[a-f0-9-]{36}\/(route|correct)$/.test(route))) {
         throttle('google:'+u.id,90,60000);
         const result=await workflow.handle(route,await body(req),u); reply(route==='/orders'?201:200,result); return;
       }
@@ -257,6 +257,7 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
               if(o.status==='accepted')o.status='seen';
             } else if(b.action==='start') {
               if(o.status==='running')return o;
+              if(o.stops.some(p=>p.needsValidation))fail(409,'Valide todos os endereços antes de iniciar.');
               if(!['accepted','seen'].includes(o.status)) fail(409,'Este pacote ainda não pode ser iniciado.');
               if(!o.route?.order)fail(409,'A rota está pendente. Calcule a rota antes de iniciar.');
               const [active]=await c.query("SELECT id FROM delivery_orders WHERE status='running' LIMIT 1");

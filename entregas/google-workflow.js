@@ -43,6 +43,7 @@ function createWorkflow({
       if (user.role === "client" && rows[0].user_id !== user.id)
         fail(403, "Acesso não permitido.");
       const o = parse(rows[0].payload);
+      if (o.stops.some(p => p.needsValidation)) fail(409, "Valide os endereços pendentes antes de calcular a rota.");
       if (
         o.routeStatus === "ready" ||
         ["running", "done", "cancelled"].includes(o.status)
@@ -168,7 +169,7 @@ function createWorkflow({
         c.query("SELECT payload FROM delivery_settings WHERE id=1"),
       );
       const s = parse(rows[0].payload);
-      if (b.base !== true) {
+      if (b.base !== true && !(u.role === "driver" && b.purpose === "correction")) {
         try {
           Object.assign(
             p,
@@ -250,13 +251,9 @@ function createWorkflow({
             p = await selection(c, input.selectionId, u.id);
           else {
             const address = String(input.address || "").trim();
-            if (
-              address.length < 8 ||
-              address.length > 300 ||
-              !/[0-9]/.test(address)
-            )
-              fail(400, "Informe rua, número e cidade de cada entrega.");
-            p = { address, inputAddress: address, manual: true };
+            if (!address || address.length > 300 || input.allowUnresolved !== true)
+              fail(400, "Confirme Enviar mesmo assim para incluir um endereço pendente.");
+            p = { address, inputAddress: address, needsValidation: true };
           }
           if (
             D.validPoint(base) &&
@@ -283,7 +280,7 @@ function createWorkflow({
           delayUntil: null,
           delivered: [],
           route: null,
-          routeStatus: b.backgroundRoute === true ? "queued" : "pending",
+          routeStatus: stops.some(p => p.needsValidation) ? "awaiting_address" : b.backgroundRoute === true ? "queued" : "pending",
         };
         await c.execute(
           "INSERT INTO delivery_orders (id,user_id,day_key,status,created_ms,payload) VALUES (?,?,?,?,?,?)",
@@ -315,11 +312,33 @@ function createWorkflow({
           console.warn("Entregas: aviso de voz sem confirmação para", saved.id);
         });
       }
+      if (saved.order.routeStatus === "awaiting_address") return saved.order;
       if (b.backgroundRoute === true) {
         void optimize(saved.id, u).catch(() => console.warn("Entregas: cálculo interrompido para", saved.id));
         return saved.order;
       }
       return optimize(saved.id, u);
+    }
+    const correction = route.match(/^\/orders\/([a-f0-9-]{36})\/correct$/);
+    if (correction) {
+      if (u.role !== 'driver') fail(403, 'Somente o entregador pode validar o endereço.');
+      const id = correction[1];
+      const order = await transaction(async c => {
+        const [rows] = await c.execute('SELECT payload FROM delivery_orders WHERE id=? FOR UPDATE', [id]);
+        if (!rows.length) fail(404, 'Pedido não encontrado.');
+        const o = parse(rows[0].payload);
+        if (!['accepted','seen','scheduled'].includes(o.status)) fail(409, 'Pedido já iniciado ou encerrado.');
+        const stop = Number.isInteger(b.index) && o.stops[b.index];
+        if (!stop?.needsValidation) fail(409, 'Este endereço já foi validado. Atualize o pedido.');
+        const place = await selection(c, b.selectionId, u.id);
+        if (!D.validPoint(place) || !place.number || (D.validPoint(o.base) && D.airDistance(o.base,place)>100000)) fail(422, 'Confira o número e a cidade do endereço corrigido.');
+        o.stops[b.index] = {...place, originalAddress:stop.address, inputAddress:place.address, priceCents:stop.priceCents};
+        o.routeStatus = o.stops.some(p=>p.needsValidation) ? 'awaiting_address' : 'queued';
+        await storeOrder(c,o);
+        return o;
+      });
+      if (order.routeStatus === 'queued') return optimize(id,u);
+      return order;
     }
     const retry = route.match(/^\/orders\/([a-f0-9-]{36})\/route$/);
     if (retry) return optimize(retry[1], u);
