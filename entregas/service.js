@@ -25,6 +25,7 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
     if (initPromise) return initPromise;
     initPromise = db(async c => {
       const tables = [
+        `CREATE TABLE IF NOT EXISTS delivery_messages (id BIGINT AUTO_INCREMENT PRIMARY KEY, order_id CHAR(36) NOT NULL, user_id INT NOT NULL, message_key CHAR(36) NOT NULL, sender VARCHAR(15) NOT NULL, message VARCHAR(1000) NOT NULL, sent_ms BIGINT NOT NULL, UNIQUE(order_id,user_id,message_key), INDEX(order_id,id))`,
         `CREATE TABLE IF NOT EXISTS delivery_users (id INT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(50) NOT NULL UNIQUE, role VARCHAR(15) NOT NULL, password_hash VARCHAR(200) NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS delivery_sessions (token_hash CHAR(64) PRIMARY KEY, user_id INT NOT NULL, expires_ms BIGINT NOT NULL, INDEX(expires_ms))`,
         `CREATE TABLE IF NOT EXISTS delivery_settings (id INT PRIMARY KEY, payload LONGTEXT NOT NULL)`,
@@ -124,13 +125,26 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
     return { ...rows[0], sessionHash: hash(raw) };
   }
   function requireRole(u, role) { if (u.role !== role) fail(403, 'Acesso não permitido.'); }
+  async function readMessages(c, ids) {
+    if (!ids.length) return {};
+    const [rows] = await c.query('SELECT order_id, id, sender, message, sent_ms AS sentAt FROM delivery_messages WHERE order_id IN (?) ORDER BY id DESC', [ids]);
+    const grouped = {};
+    for (const {order_id, ...entry} of rows) (grouped[order_id] ??= []).push(entry);
+    return grouped;
+  }
+  async function chatOrder(c, id, user, lock = false) {
+    const [rows] = await c.execute(`SELECT status,user_id FROM delivery_orders WHERE id=?${lock ? ' FOR UPDATE' : ''}`, [id]);
+    if (!rows.length || (user.role !== 'driver' && rows[0].user_id !== user.id)) fail(404,'Pedido não encontrado.');
+    return rows[0];
+  }
   async function snapshot(u) {
     if(now()-lastMaintenance>=15000)await maintain();
     return db(async c => {
       const s = await settings(c);
       const [rows] = await c.execute(`SELECT payload FROM delivery_orders WHERE (day_key=? OR status NOT IN ('done','cancelled')) ${u.role === 'client' ? 'AND user_id=?' : ''} ORDER BY created_ms DESC`, u.role === 'client' ? [D.localDay(now()), u.id] : [D.localDay(now())]);
       const orders = rows.map(r => workflow.decorate(json(r.payload)));
-      return { user: { username: u.username, role: u.role }, settings: s, availability: D.availability(s, now()), orders,
+      const messages = await readMessages(c, orders.filter(o=>!terminal(o)).map(o=>o.id));
+      return { user: { username: u.username, role: u.role }, settings: s, availability: D.availability(s, now()), orders, messages,
         day: D.localDay(now()), serverTime: now(), mapsReady: Boolean(process.env.GOOGLE_ROUTES_API_KEY && process.env.GOOGLE_PLACES_API_KEY), googleBudget: u.role === 'driver' ? await budget.summary() : undefined,
         totalCents: orders.filter(o => o.day === D.localDay(now()) && o.status !== 'cancelled').reduce((n,o) => n+o.totalCents,0) };
     });
@@ -162,6 +176,31 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
         res.once('close',()=>{clearInterval(heartbeat);clearTimeout(expiry);listeners.delete(res);});return;
       }
       if (route === '/state' && req.method === 'GET') { reply(200, await snapshot(u)); return; }
+      const chat = route.match(/^\/orders\/([a-f0-9-]{36})\/messages$/);
+      if (chat && req.method === 'GET') {
+        const messages = await db(async c => {
+          await chatOrder(c, chat[1], u);
+          return (await readMessages(c,[chat[1]]))[chat[1]] || [];
+        });
+        reply(200,{messages}); return;
+      }
+      if (chat && req.method === 'POST') {
+        const b = await body(req);
+        const message = typeof b.message === 'string' ? b.message.trim() : '';
+        if (!message || message.length > 1000 || !/^[a-f0-9-]{36}$/i.test(b.messageKey || '')) fail(400,'Informe uma mensagem de até 1.000 caracteres.');
+        throttle('chat:'+u.id, 60, 60000);
+        await transaction(async c => {
+          const order = await chatOrder(c,chat[1],u,true);
+          const [previous] = await c.execute('SELECT message FROM delivery_messages WHERE order_id=? AND user_id=? AND message_key=?',[chat[1],u.id,b.messageKey]);
+          if (previous.length) {
+            if (previous[0].message !== message) fail(409,'Esta mensagem já foi enviada com outro texto.');
+            return;
+          }
+          if (terminal(order)) fail(409,'O pedido foi encerrado. A conversa está disponível para consulta.');
+          await c.execute('INSERT INTO delivery_messages (order_id,user_id,message_key,sender,message,sent_ms) VALUES (?,?,?,?,?,?)',[chat[1],u.id,b.messageKey,u.role==='driver'?'entregador':'farmacia',message,now()]);
+        });
+        reply(200,{ok:true}); return;
+      }
       if (req.method === 'POST' && (['/autocomplete','/resolve','/google-base','/orders'].includes(route) || /^\/orders\/[a-f0-9-]{36}\/route$/.test(route))) {
         throttle('google:'+u.id,90,60000);
         const result=await workflow.handle(route,await body(req),u); reply(route==='/orders'?201:200,result); return;

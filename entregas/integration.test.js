@@ -37,6 +37,21 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   const ready=[r1.data,r2.data].find(o=>o.routeStatus==='ready');assert.ok(ready);
   assert.equal(new URL(ready.navigation[0].url).searchParams.has('origin'),false);
   const id=r1.data.id;
+  const chatPath=`/orders/${id}/messages`;
+  const msg={messageKey:crypto.randomUUID(),message:'Portão azul',sender:'entregador'};
+  assert.equal((await request(chatPath,msg)).status,401);
+  const chatStreamAbort=new AbortController();const liveChat=await fetch(origin+'/updates',{headers:{Authorization:'Bearer '+driver},signal:chatStreamAbort.signal});
+  const chatReader=liveChat.body.getReader();await chatReader.read();
+  try {
+    const sends=await Promise.all([request(chatPath,msg,client),request(chatPath,msg,client)]);
+    assert.ok(sends.every(r=>r.status===200));
+    assert.match(Buffer.from((await chatReader.read()).value).toString(),/event: change/);
+  }finally{chatStreamAbort.abort();await chatReader.cancel().catch(()=>{});}
+  await request(chatPath,{messageKey:crypto.randomUUID(),message:'Estou chegando'},driver);
+  const thread=(await request('/state',undefined,client)).data.messages[id];
+  assert.deepEqual(thread.map(m=>[m.sender,m.message]),[['entregador','Estou chegando'],['farmacia','Portão azul']]);
+  assert.equal((await request(`/orders/${crypto.randomUUID()}/messages`,undefined,driver)).status,404);
+
   // A conta do entregador deve enxergar imediatamente a encomenda criada pela farmácia.
   const pendingDriver=(await request('/state',undefined,driver));
   assert.equal(pendingDriver.status,200);
@@ -60,6 +75,8 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   clock=Date.parse('2026-11-04T00:01:00-03:00');await service.maintain();
   s=(await request('/state',undefined,client)).data;assert.equal(s.totalCents,0);assert.equal(s.orders.length,1);
   assert.equal((await request(`/orders/${id}/action`,{action:'finish'},driver)).status,200);
+  assert.equal((await request(chatPath,{messageKey:crypto.randomUUID(),message:'novo'},driver)).status,409);
+  assert.equal((await request(chatPath,undefined,client)).data.messages.length,2);
   const history=(await request('/history?day=2026-11-03',undefined,client)).data;assert.equal(history.items.length,1);assert.equal(history.items[0].priceCents,1234);assert.equal(history.orders.length,1);assert.equal(history.orders[0].status,'done');assert.equal(history.orders[0].totalCents,1234);
   assert.equal((await request('/state',undefined,client)).data.orders.length,0);
   clock=Date.parse('2026-11-04T12:00:00-03:00');await request('/availability',{action:'open'},driver);
@@ -94,6 +111,6 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   clock+=31*86400000;assert.equal((await request('/state',undefined,driver)).status,401);
  }finally{
   service.stop();await new Promise(r=>server.close(r));process.env.GOOGLE_ROUTES_API_KEY=originalKey||'';fs.unlinkSync(seed);
-  const c=await mysql.createConnection(config);for(const suffix of ['users','sessions','settings','orders','quotes','history','history_items','usage','places','submissions','google_operations','google_monitor'])await c.query('DROP TABLE IF EXISTS `'+prefix+suffix+'`');await c.end();
+  const c=await mysql.createConnection(config);for(const suffix of ['users','sessions','settings','orders','quotes','history','history_items','messages','usage','places','submissions','google_operations','google_monitor'])await c.query('DROP TABLE IF EXISTS `'+prefix+suffix+'`');await c.end();
  }
 });
