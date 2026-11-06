@@ -72,15 +72,20 @@ function createWorkflow({
         ? e.message
         : "Cálculo indisponível. O pedido foi registrado.";
     }
+    let estimate = null;
+    if (result) {
+      try { estimate = await google.estimateTrip(initial.base, initial.stops, result, initial.priority ?? -1, initial.id+':estimate:'+initial.routeAttempt); }
+      catch { /* Navigation stays available when the estimate quota is exhausted. */ }
+    }
     return transaction(async (c) => {
       const [rows] = await c.execute(
         "SELECT payload FROM delivery_orders WHERE id=? FOR UPDATE",
         [id],
       );
       const o = parse(rows[0].payload);
-      if (o.routeAttempt !== initial.routeAttempt) return decorate(o);
+      if (["done","cancelled"].includes(o.status) || o.routeAttempt !== initial.routeAttempt) return decorate(o);
       if (result) {
-        o.route = { order: result.order, quality: result.quality };
+        o.route = { order: result.order, quality: result.quality, estimate };
         o.routeStatus = "ready";
         o.routeError = null;
       } else {
@@ -169,7 +174,7 @@ function createWorkflow({
         c.query("SELECT payload FROM delivery_settings WHERE id=1"),
       );
       const s = parse(rows[0].payload);
-      if (b.base !== true && !(u.role === "driver" && b.purpose === "correction")) {
+      if (b.base !== true) {
         try {
           Object.assign(
             p,
@@ -241,9 +246,9 @@ function createWorkflow({
         const stops = [];
         for (const input of b.stops) {
           if (
-            !Number.isInteger(input.priceCents) ||
+            input.selectionId && (!Number.isInteger(input.priceCents) ||
             input.priceCents < 0 ||
-            input.priceCents > 100000
+            input.priceCents > 100000)
           )
             fail(400, "Informe um valor entre R$ 0 e R$ 1.000 por entrega.");
           let p;
@@ -261,7 +266,7 @@ function createWorkflow({
             D.airDistance(base, p) > 100000
           )
             fail(400, "Endereço a mais de 100 km. Confira a cidade.");
-          stops.push({ ...p, priceCents: input.priceCents });
+          stops.push({ ...p, priceCents: p.needsValidation ? null : input.priceCents });
         }
         const o = {
           id: crypto.randomUUID(),
@@ -319,6 +324,22 @@ function createWorkflow({
       }
       return optimize(saved.id, u);
     }
+    const estimateRequest=route.match(/^\/orders\/([a-f0-9-]{36})\/estimate$/);
+    if(estimateRequest){
+      if(u.role!=='driver')fail(403,'Acesso não permitido.');
+      const id=estimateRequest[1];
+      const [rows]=await db(c=>c.execute('SELECT payload FROM delivery_orders WHERE id=?',[id]));
+      const order=rows[0] && parse(rows[0].payload);
+      if(!order?.route || ['done','cancelled'].includes(order.status))fail(409,'Rota indisponível.');
+      if(order.route.estimate)return order.route.estimate;
+      const estimate=await google.estimateTrip(order.base,order.stops,order.route,order.priority??-1,id+':estimate-request:'+new Date(now()).toISOString().slice(0,10));
+      await transaction(async c=>{
+        const [current]=await c.execute('SELECT payload FROM delivery_orders WHERE id=? FOR UPDATE',[id]);
+        const o=current[0] && parse(current[0].payload);
+        if(!o?.route || ['done','cancelled'].includes(o.status))return;
+        o.route.estimate=estimate;await storeOrder(c,o);
+      });return estimate;
+    }
     const correction = route.match(/^\/orders\/([a-f0-9-]{36})\/correct$/);
     if (correction) {
       if (u.role !== 'driver') fail(403, 'Somente o entregador pode validar o endereço.');
@@ -332,12 +353,14 @@ function createWorkflow({
         if (!stop?.needsValidation) fail(409, 'Este endereço já foi validado. Atualize o pedido.');
         const place = await selection(c, b.selectionId, u.id);
         if (!D.validPoint(place) || !place.number || (D.validPoint(o.base) && D.airDistance(o.base,place)>100000)) fail(422, 'Confira o número e a cidade do endereço corrigido.');
-        o.stops[b.index] = {...place, originalAddress:stop.address, inputAddress:place.address, priceCents:stop.priceCents};
+        if (!Number.isInteger(b.priceCents) || b.priceCents<0 || b.priceCents>100000) fail(400,'Informe um valor entre R$ 0 e R$ 1.000.');
+        o.stops[b.index] = {...place, originalAddress:stop.address, inputAddress:place.address, priceCents:b.priceCents};
+        o.totalCents = o.stops.reduce((total,p)=>total+(p.priceCents ?? 0),0);
         o.routeStatus = o.stops.some(p=>p.needsValidation) ? 'awaiting_address' : 'queued';
         await storeOrder(c,o);
         return o;
       });
-      if (order.routeStatus === 'queued') return optimize(id,u);
+      if (order.routeStatus === 'queued') void optimize(id,u).catch(()=>console.warn('Entregas: cálculo interrompido para',id));
       return order;
     }
     const retry = route.match(/^\/orders\/([a-f0-9-]{36})\/route$/);

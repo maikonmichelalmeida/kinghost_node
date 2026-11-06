@@ -33,9 +33,10 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   const stops=[{selectionId:resolved.data.selectionId,priceCents:1234}];
   const submit={submissionId:crypto.randomUUID(),stops};
   const [r1,r2]=await Promise.all([request('/orders',submit,client),request('/orders',submit,client)]);
-  assert.equal(r1.status,201);assert.equal(r1.data.id,r2.data.id);assert.equal(r1.data.totalCents,1234);assert.equal(r1.data.stops[0].suggestedCents,700);assert.equal(r1.data.status,'scheduled');assert.equal(calls,2);
+  assert.equal(r1.status,201);assert.equal(r1.data.id,r2.data.id);assert.equal(r1.data.totalCents,1234);assert.equal(r1.data.stops[0].suggestedCents,700);assert.equal(r1.data.status,'scheduled');assert.equal(calls,3);
   const ready=[r1.data,r2.data].find(o=>o.routeStatus==='ready');assert.ok(ready);
   assert.equal(new URL(ready.navigation[0].url).searchParams.has('origin'),false);
+  assert.deepEqual(ready.route.estimate,{meters:3900,minutes:7});
   const id=r1.data.id;
   const chatPath=`/orders/${id}/messages`;
   const msg={messageKey:crypto.randomUUID(),message:'Portão azul',sender:'entregador'};
@@ -64,6 +65,7 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   assert.equal((await request(`/orders/${id}/action`,{action:'seen'},client)).status,403);
   await request(`/orders/${id}/action`,{action:'seen'},driver);
   assert.equal((await request('/state',undefined,client)).data.orders.find(o=>o.id===id)?.status,'seen');
+  assert.equal((await request(`/orders/${id}/action`,{action:'cancel'},driver)).status,409);
   await request(`/orders/${id}/action`,{action:'delay',minutes:10},driver);
   assert.equal((await request(`/orders/${id}/action`,{action:'start'},driver)).status,200);
   assert.equal((await request('/state',undefined,client)).data.orders.find(o=>o.id===id)?.status,'running');
@@ -121,15 +123,25 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   assert.equal((await request(partPath,{...check,checked:false},driver)).status,409);
   const last=(await request(partPath,{action:'advance',part:2},driver)).data;assert.equal(last.part.number,3);assert.equal(last.delivered.length,8);assert.equal(last.navigation[0].returnsHome,true);
   assert.equal((await request(partPath,{action:'finish'},driver)).data.status,'done');
-  const mixed={submissionId:crypto.randomUUID(),priority:1,stops:[{selectionId,priceCents:700},{address:'Estrada sem placa',priceCents:810,allowUnresolved:true},{address:'Portão norte',priceCents:930,allowUnresolved:true}]};
+  const mixed={submissionId:crypto.randomUUID(),priority:1,stops:[{selectionId,priceCents:700},{address:'Estrada sem placa',priceCents:null,allowUnresolved:true},{address:'Portão norte',priceCents:null,allowUnresolved:true}]};
   const beforeMaps=calls,review=await request('/orders',mixed,client);assert.equal(review.status,201);assert.equal(review.data.routeStatus,'awaiting_address');assert.equal(review.data.route,null);assert.equal(calls,beforeMaps);
   const pendingPath=`/orders/${review.data.id}`;
   assert.equal((await request(pendingPath+'/route',{},driver)).status,409);assert.equal((await request(pendingPath+'/action',{action:'start'},driver)).status,409);
-  const approved=await resolveTest(driver,'driver-place');const fix={index:1,selectionId:approved};
+  const approved=await resolveTest(driver,'driver-place');const fix={index:1,selectionId:approved,priceCents:850};
+  assert.equal(review.data.totalCents,700);assert.equal(review.data.stops[1].priceCents,null);
+  assert.equal((await request(pendingPath+'/correct',{...fix,priceCents:null},driver)).status,400);
   assert.equal((await request(pendingPath+'/correct',fix,client)).status,403);
   assert.equal((await request(pendingPath+'/correct',{index:1,selectionId},driver)).status,409);
   const afterLookup=calls;const firstFix=await request(pendingPath+'/correct',fix,driver);assert.equal(firstFix.status,200);assert.equal(firstFix.data.routeStatus,'awaiting_address');assert.equal(calls,afterLookup);
-  const lastFix=await request(pendingPath+'/correct',{...fix,index:2},driver);assert.equal(lastFix.status,200);assert.equal(lastFix.data.routeStatus,'ready');assert.equal(lastFix.data.route.order[0],1);assert.equal(lastFix.data.totalCents,2440);assert.ok(lastFix.data.navigation[0].url.includes('google.com/maps'));
+  const lastFix=await request(pendingPath+'/correct',{...fix,index:2,priceCents:1050},driver);assert.equal(lastFix.status,200);assert.equal(lastFix.data.totalCents,2600);
+  let finalRoute;for(let n=0;n<60;n++){finalRoute=(await request('/state',undefined,client)).data.orders.find(o=>o.id===review.data.id);if(finalRoute.routeStatus==='ready')break;await new Promise(r=>setTimeout(r,40));}
+  assert.equal(finalRoute.route.order[0],1);assert.deepEqual(finalRoute.route.estimate,{meters:7800,minutes:15});assert.ok(finalRoute.navigation[0].url.includes('google.com/maps'));
+  const balanceBeforeCancel=(await request('/state',undefined,client)).data.totalCents;
+  await request(pendingPath+'/messages',{messageKey:crypto.randomUUID(),message:'Cancelar antes do aceite'},client);
+  const cancelled=await request(pendingPath+'/action',{action:'cancel'},driver);assert.equal(cancelled.status,200);assert.equal(cancelled.data.totalCents,0);
+  assert.equal((await request('/state',undefined,client)).data.totalCents,balanceBeforeCancel-2600);
+  assert.equal((await request(pendingPath+'/messages',undefined,driver)).data.messages[0].message,'Cancelar antes do aceite');
+  assert.equal((await request(pendingPath+'/messages',{messageKey:crypto.randomUUID(),message:'após'},client)).status,409);
   assert.equal((await request(pendingPath+'/correct',fix,driver)).status,409);
   // A simultaneous burst reserves at most the configured 20 routes per minute.
   clock+=60000;let executions=0;

@@ -62,7 +62,7 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
   async function archiveItems(c,o){
     for(const [index,p] of o.stops.entries()){
       const delivered=o.delivered?.find(d=>d.index===index);
-      const item={orderId:o.id,index,address:p.inputAddress&&/\d/.test(p.inputAddress)?p.inputAddress:p.address,priceCents:p.priceCents,createdAt:o.createdAt,acceptedAt:o.acceptedAt,seenAt:o.seenAt,startedAt:o.startedAt,finishedAt:delivered?.at||o.finishedAt,status:delivered?'done':o.status,cancelReason:o.cancelReason||null};
+      const item={orderId:o.id,index,address:p.inputAddress&&/\d/.test(p.inputAddress)?p.inputAddress:p.address,priceCents:o.status==='cancelled'?0:p.priceCents,createdAt:o.createdAt,acceptedAt:o.acceptedAt,seenAt:o.seenAt,startedAt:o.startedAt,finishedAt:delivered?.at||o.finishedAt,status:o.status==='cancelled'?'cancelled':delivered?'done':o.status,cancelReason:o.cancelReason||null};
       await c.execute(`INSERT INTO delivery_history_items (order_id,stop_index,day_key,finished_day,payload) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE finished_day=VALUES(finished_day),payload=VALUES(payload)`,[o.id,index,o.day,item.finishedAt?D.localDay(item.finishedAt):null,JSON.stringify(item)]);
     }
   }
@@ -202,7 +202,7 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
         });
         reply(200,{ok:true}); return;
       }
-      if (req.method === 'POST' && (['/autocomplete','/resolve','/google-base','/orders'].includes(route) || /^\/orders\/[a-f0-9-]{36}\/(route|correct)$/.test(route))) {
+      if (req.method === 'POST' && (['/autocomplete','/resolve','/google-base','/orders'].includes(route) || /^\/orders\/[a-f0-9-]{36}\/(route|correct|estimate)$/.test(route))) {
         throttle('google:'+u.id,90,60000);
         const result=await workflow.handle(route,await body(req),u); reply(route==='/orders'?201:200,result); return;
       }
@@ -242,9 +242,8 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
           const o=json(rows[0].payload);
           if(terminal(o)) fail(409,'Esse pacote já foi encerrado.');
           if(b.action==='cancel') {
-            if(u.role==='client'&&!['scheduled','accepted'].includes(o.status)) fail(409,'O pacote já foi visualizado. Fale com Maikon para cancelar.');
-            if(!text(b.reason,300)) fail(400,'Informe o motivo do cancelamento.');
-            o.status='cancelled';o.cancelReason=text(b.reason);o.finishedAt=now();
+            if(o.seenAt || !['scheduled','accepted'].includes(o.status)) fail(409,'O pedido já foi aceito pelo entregador.');
+            o.status='cancelled';o.totalCents=0;o.cancelReason=text(b.reason) || (u.role==='driver'?'Cancelado pelo entregador':'Cancelado pela farmácia');o.finishedAt=now();
           } else {
             requireRole(u,'driver');
             if(b.action==='seen') {

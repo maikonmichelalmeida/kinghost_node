@@ -204,7 +204,7 @@ function createGoogle({ budget, fetchImpl = fetchMaps }) {
     )
       throw failure("Nenhuma rota válida foi encontrada.", 422);
     const order =
-      intermediates.length <= 1
+      !optimize || intermediates.length <= 1
         ? intermediates.map((_, i) => i)
         : validateOrder(
             route.optimizedIntermediateWaypointIndex,
@@ -218,7 +218,7 @@ function createGoogle({ budget, fetchImpl = fetchMaps }) {
   }
   async function suggest(base, stop, id) {
     const r = await compute(base, stop, [], id, false);
-    return { suggestedCents: D.price(r.meters), meters: r.meters };
+    return { suggestedCents: D.price(r.meters), meters: r.meters, legSeconds: r.seconds };
   }
   async function optimize(base, stops, id, priority = -1) {
     const indices = stops.map((_, i) => i).filter((i) => i !== priority);
@@ -237,6 +237,7 @@ function createGoogle({ budget, fetchImpl = fetchMaps }) {
     return {
       order,
       quality: section.quality,
+      meters: section.meters, seconds: section.seconds,
       links: navigation(stops, order, base),
     };
   }
@@ -293,6 +294,29 @@ function createGoogle({ budget, fetchImpl = fetchMaps }) {
       links: navigation(stops, order, base),
     };
   }
-  return { autocomplete, details, geocode, suggest, optimize };
+  async function estimateTrip(base, stops, route, priority, id) {
+    let meters = route.meters, seconds = route.seconds;
+    if (!Number.isFinite(meters) || !Number.isFinite(seconds)) {
+      // Fixed or older routes: measure the chosen order, with the return to base.
+      const remaining = route.order.map(i => stops[i]);
+      let origin = base, part = 0;
+      meters = 0; seconds = 0;
+      while (remaining.length) {
+        const via = remaining.splice(0, 25);
+        const destination = remaining.length ? via.pop() : base;
+        const leg = await compute(origin, destination, via, `${id}:fixed:${part++}`, false);
+        meters += leg.meters; seconds += leg.seconds; origin = destination;
+      }
+    } else if (priority >= 0) {
+      // Optimization starts at the priority stop. Include the approach from home.
+      const first = stops[priority];
+      const leg = Number.isFinite(first.legSeconds) && Number.isFinite(first.meters)
+        ? {meters:first.meters, seconds:first.legSeconds}
+        : await compute(base, first, [], `${id}:approach`, false);
+      meters += leg.meters; seconds += leg.seconds;
+    }
+    return {meters, minutes:Math.ceil(seconds / 60) + 2 * stops.length};
+  }
+  return { autocomplete, details, geocode, suggest, optimize, estimateTrip };
 }
 module.exports = { createGoogle };
