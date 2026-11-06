@@ -210,6 +210,10 @@ function createWorkflow({
         .update(u.id + ":" + b.submissionId)
         .digest("hex");
       const priority = b.priority ?? -1;
+      const firstMessage = b.firstMessage ?? "";
+      if (typeof firstMessage !== "string" || firstMessage.trim().length > 1000)
+        fail(400, "A primeira mensagem deve ter até 1.000 caracteres.");
+      const message = firstMessage.trim();
       if (
         !Number.isInteger(priority) ||
         priority < -1 ||
@@ -219,7 +223,7 @@ function createWorkflow({
         fail(400, "Prioridade inválida.");
       const signature = crypto
         .createHash("sha256")
-        .update(JSON.stringify([b.stops, priority]))
+        .update(JSON.stringify(message ? [b.stops, priority, message] : [b.stops, priority]))
         .digest("hex");
       const saved = await transaction(async (c, s) => {
         const [existing] = await c.execute(
@@ -281,7 +285,7 @@ function createWorkflow({
           delayUntil: null,
           delivered: [],
           route: null,
-          routeStatus: "pending",
+          routeStatus: b.backgroundRoute === true ? "queued" : "pending",
         };
         await c.execute(
           "INSERT INTO delivery_orders (id,user_id,day_key,status,created_ms,payload) VALUES (?,?,?,?,?,?)",
@@ -291,7 +295,13 @@ function createWorkflow({
           "INSERT INTO delivery_submissions (id,signature,order_id) VALUES (?,?,?)",
           [key, signature, o.id],
         );
-        return { id: o.id, alertUntil: av.open ? s.openUntil : 0 };
+        if (message) {
+          await c.execute(
+            "INSERT INTO delivery_messages (order_id,user_id,message_key,sender,message,sent_ms) VALUES (?,?,?,?,?,?)",
+            [o.id, u.id, b.submissionId, "farmacia", message, o.createdAt],
+          );
+        }
+        return { id: o.id, order: o, alertUntil: av.open ? s.openUntil : 0 };
       });
       // A retry of the HTTP submission never creates another billable optimization.
       if (saved.duplicate) {
@@ -306,6 +316,10 @@ function createWorkflow({
         void announceNewOrder().catch(() => {
           console.warn("Entregas: aviso de voz sem confirmação para", saved.id);
         });
+      }
+      if (b.backgroundRoute === true) {
+        void optimize(saved.id, u).catch(() => console.warn("Entregas: cálculo interrompido para", saved.id));
+        return saved.order;
       }
       return optimize(saved.id, u);
     }

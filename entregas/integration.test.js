@@ -8,8 +8,8 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
  const dir=path.join(__dirname,'../../work');fs.mkdirSync(dir,{recursive:true});const seed=path.join(dir,prefix+'accounts.json');
  fs.writeFileSync(seed,JSON.stringify(['driver','client'].map(role=>{const salt=crypto.randomBytes(16).toString('hex');return{username:role+'-test',role,passwordHash:salt+':'+crypto.scryptSync('test-only-password',salt,64).toString('hex')}})));
  let clock=Date.parse('2026-11-03T09:00:00-03:00');const originalKey=process.env.GOOGLE_ROUTES_API_KEY;process.env.GOOGLE_ROUTES_API_KEY='fake-test-key';process.env.GOOGLE_PLACES_API_KEY='fake-test-key';
- let calls=0,alerts=0,simulateFailure=false;const service=createService({openDb,seedFile:seed,now:()=>clock,announceNewOrder:async()=>{alerts++;throw new Error("simulated voice outage");},monitorProvider:async()=>({counts:{routes:0,autocomplete:0,details:0,geocode:0},cutoff:clock-3600000}),fetchImpl:async(url,options)=>{
-  calls++;if(simulateFailure)throw new Error('mock timeout');
+ let routeGate=null,calls=0,alerts=0,simulateFailure=false;const service=createService({openDb,seedFile:seed,now:()=>clock,announceNewOrder:async()=>{alerts++;throw new Error("simulated voice outage");},monitorProvider:async()=>({counts:{routes:0,autocomplete:0,details:0,geocode:0},cutoff:clock-3600000}),fetchImpl:async(url,options)=>{
+  calls++;if(routeGate)await routeGate;if(simulateFailure)throw new Error('mock timeout');
   const b=options.body?JSON.parse(options.body):{};
   if(String(url).includes('/places/'))return {ok:true,json:async()=>({id:'place-test',formattedAddress:'Rua Teste, 1, Gravataí',location:{latitude:-29.95,longitude:-50.98},addressComponents:[{types:['street_number'],longText:'1'}]})};
   return{ok:true,json:async()=>({routes:[{duration:'250s',distanceMeters:3900,optimizedIntermediateWaypointIndex:(b.intermediates||[]).map((_,i)=>i).reverse()}]})};
@@ -86,6 +86,22 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   const repeated=await request('/orders',liveSubmission,client);assert.equal(repeated.data.id,failed.data.id);assert.equal(alerts,1);
   assert.equal(failed.status,201);assert.equal(failed.data.routeStatus,'pending');assert.equal(failed.data.route,null);
   assert.equal((await request('/state',undefined,driver)).data.orders.some(o=>o.id===failed.data.id),true);
+  // Even with slow Maps, the receipt and the first chat message are available immediately.
+  let releaseRoute;routeGate=new Promise(resolve=>{releaseRoute=resolve;});simulateFailure=false;
+  const background={...liveSubmission,submissionId:crypto.randomUUID(),backgroundRoute:true,firstMessage:'Portão lateral'};
+  const watchdog=setTimeout(releaseRoute,4000);
+  let created;
+  try {
+    created=await request('/orders',background,client);assert.equal(created.status,201);assert.equal(created.data.routeStatus,'queued');
+    const receipt=await request('/state',undefined,driver);assert.deepEqual(receipt.data.messages[created.data.id].map(m=>m.message),['Portão lateral']);
+    assert.equal((await request('/orders',background,client)).data.id,created.data.id);
+    assert.equal((await request('/orders',{...background,firstMessage:'Diferente'},client)).status,409);
+  }finally{clearTimeout(watchdog);releaseRoute();routeGate=null;}
+  for(let tries=0;tries<50;tries++){const snapshot=(await request('/state',undefined,driver)).data;
+    if(snapshot.orders.find(o=>o.id===created.data.id)?.routeStatus==='ready')break;
+    await new Promise(r=>setTimeout(r,40));}
+  const startPath=`/orders/${created.data.id}/action`;
+  for(let attempt=0;attempt<2;attempt++){const started=await request(startPath,{action:'start'},driver);assert.equal(started.status,200);assert.ok(started.data.navigation[0].url);}
   // A simultaneous burst reserves at most the configured 20 routes per minute.
   clock+=60000;let executions=0;
   const burst=await Promise.allSettled(Array.from({length:30},(_,i)=>service.budget.call('routes','burst-'+i,{i},async()=>{executions++;return {ok:true};})));

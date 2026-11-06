@@ -255,6 +255,7 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
               o.seenAt=o.seenAt||now();o.delayUntil=now()+minutes*60000;
               if(o.status==='accepted')o.status='seen';
             } else if(b.action==='start') {
+              if(o.status==='running')return o;
               if(!['accepted','seen'].includes(o.status)) fail(409,'Este pacote ainda não pode ser iniciado.');
               if(!o.route?.order)fail(409,'A rota está pendente. Calcule a rota antes de iniciar.');
               const [active]=await c.query("SELECT id FROM delivery_orders WHERE status='running' LIMIT 1");
