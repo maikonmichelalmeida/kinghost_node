@@ -79,4 +79,18 @@ function validateOrder(order, count) {
     throw new Error("Google retornou uma sequência incompleta.");
   return order;
 }
-module.exports = { waypoint, navigation, pendingNavigation, validateOrder };
+function deliveryPart(o) {
+  const chunks = navigation(o.stops, o.route.order, o.base);
+  // An older running order may already have finished whole Maps links.
+  const done = new Set(o.delivered.map(item => item.index));
+  const firstRemaining = chunks.findIndex(chunk => chunk.returnsHome || chunk.indices.some(i => !done.has(i)));
+  const index = o.partIndex ?? firstRemaining;
+  const chunk = chunks[index];
+  return {
+    index, number: index + 1, total: chunks.length, indices: chunk.indices,
+    completedIndices: chunks.slice(0, index).flatMap(part => part.indices),
+    links: navigation(o.stops, chunk.indices.filter(i => !done.has(i)), o.base, chunk.returnsHome)
+      .map(link => ({...link, segment: index + 1, segments: chunks.length})),
+  };
+}
+module.exports = { waypoint, navigation, pendingNavigation, validateOrder, deliveryPart };

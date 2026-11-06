@@ -1,7 +1,7 @@
 "use strict";
 const crypto = require("crypto");
 const D = require("./domain");
-const { navigation, pendingNavigation } = require("./google-navigation");
+const { deliveryPart } = require("./google-navigation");
 const fail = (status, message) => {
   throw Object.assign(new Error(message), { status });
 };
@@ -91,13 +91,11 @@ function createWorkflow({
     });
   }
   function decorate(o) {
-    if (o.route?.order && o.base && !["done", "cancelled"].includes(o.status))
-      o.navigation = pendingNavigation(
-        o.stops,
-        o.route.order,
-        o.base,
-        o.delivered || [],
-      );
+    if (o.route?.order && o.base && !["done", "cancelled"].includes(o.status)) {
+      const { links, ...part } = deliveryPart(o);
+      o.part = part;
+      o.navigation = links;
+    }
     return o;
   }
   async function handle(route, b, u) {

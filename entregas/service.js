@@ -5,6 +5,7 @@ const path = require('path');
 const { promisify } = require('util');
 const scrypt = promisify(crypto.scrypt);
 const D = require('./domain');
+const { deliveryPart } = require('./google-navigation');
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const json = value => typeof value === 'string' ? JSON.parse(value) : value;
 const fail = (status, message) => { const e = new Error(message); e.status = status; throw e; };
@@ -260,15 +261,23 @@ function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, ann
               if(!o.route?.order)fail(409,'A rota está pendente. Calcule a rota antes de iniciar.');
               const [active]=await c.query("SELECT id FROM delivery_orders WHERE status='running' LIMIT 1");
               if(active.length) fail(409,'Conclua o pacote em andamento antes de iniciar outro.');
-              o.status='running';o.startedAt=now();o.seenAt=o.seenAt||now();o.delayUntil=null;
+              o.status='running';o.partIndex=0;o.startedAt=now();o.seenAt=o.seenAt||now();o.delayUntil=null;
             } else if(b.action==='delivered') {
               if(o.status!=='running')fail(409,'Inicie a rota primeiro.');
-              const index=Number(b.index);const next=o.route.order.find(i=>!o.delivered.some(d=>d.index===i));
-              if(index!==next)fail(409,'Conclua as entregas na ordem da rota.');
-              o.delivered.push({index,at:now()});
-            } else if(b.action==='finish') {
-              if(o.status!=='running'||o.delivered.length!==o.stops.length)fail(409,'Marque todas as entregas antes de concluir.');
-              o.status='done';o.finishedAt=now();
+              const index=b.index,checked=b.checked ?? true;
+              if(!Number.isInteger(index)||index<0||index>=o.stops.length||typeof checked!=='boolean') fail(400,'Marcação inválida.');
+              const part=deliveryPart(o);o.partIndex=part.index;
+              if(part.completedIndices.includes(index))fail(409,'Esta parte já foi concluída.');
+              if(checked && !o.delivered.some(d=>d.index===index))o.delivered.push({index,at:now()});
+              if(!checked)o.delivered=o.delivered.filter(d=>d.index!==index);
+            } else if(b.action==='finish' || b.action==='advance') {
+              if(o.status!=='running')fail(409,'Inicie o pedido antes de concluir.');
+              const part=deliveryPart(o),final=part.number===part.total;
+              if(b.action==='advance' && b.part!==part.number)fail(409,'A parte atual mudou. Atualize o pedido.');
+              if(final!==(b.action==='finish'))fail(409,'Conclua a parte atual da rota.');
+              const at=now();
+              for(const index of part.indices)if(!o.delivered.some(d=>d.index===index))o.delivered.push({index,at});
+              if(final){o.status='done';o.finishedAt=at;}else{o.partIndex=part.index+1;}
             } else fail(400,'Ação inválida.');
           }
           await storeOrder(c,o);return o;

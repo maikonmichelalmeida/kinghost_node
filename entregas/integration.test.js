@@ -67,7 +67,6 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
   await request(`/orders/${id}/action`,{action:'delay',minutes:10},driver);
   assert.equal((await request(`/orders/${id}/action`,{action:'start'},driver)).status,200);
   assert.equal((await request('/state',undefined,client)).data.orders.find(o=>o.id===id)?.status,'running');
-  assert.equal((await request(`/orders/${id}/action`,{action:'finish'},driver)).status,409);
   clock=Date.parse('2026-11-03T20:30:00-03:00');
   assert.equal((await request('/orders',{submissionId:crypto.randomUUID(),stops},client)).status,409);
   assert.equal((await request('/availability',{action:'open'},driver)).status,400);
@@ -102,6 +101,23 @@ test('API com MySQL isolado: sessões, permissões, preço editado, idempotênci
     await new Promise(r=>setTimeout(r,40));}
   const startPath=`/orders/${created.data.id}/action`;
   for(let attempt=0;attempt<2;attempt++){const started=await request(startPath,{action:'start'},driver);assert.equal(started.status,200);assert.ok(started.data.navigation[0].url);}
+  // A single link can finish immediately; finishing marks all its stops.
+  const finished=(await request(startPath,{action:'finish'},driver));assert.equal(finished.status,200);assert.equal(finished.data.delivered.length,2);
+  const multi=await request('/orders',{submissionId:crypto.randomUUID(),stops:Array.from({length:8},(_,i)=>({address:`Rua Teste, ${100+i}, Gravataí`,priceCents:700}))},client);
+  const partPath=`/orders/${multi.data.id}/action`,started=(await request(partPath,{action:'start'},driver)).data;
+  assert.equal(started.part.total,3);const indices=started.part.indices;const index=indices[2];
+  const check={action:'delivered',index,checked:true};assert.equal((await request(partPath,check,client)).status,403);
+  const marked=(await request(partPath,check,driver)).data.delivered[0];
+  assert.equal((await request('/state',undefined,client)).data.orders.find(o=>o.id===multi.data.id).delivered[0].index,index);
+  assert.equal((await request(partPath,{...check,checked:false},driver)).data.delivered.length,0);
+  await request(partPath,check,driver);clock+=500;
+  assert.equal((await request(partPath,{action:'finish'},driver)).status,409);
+  const advanced=(await request(partPath,{action:'advance',part:1},driver)).data;
+  assert.equal(advanced.part.number,2);assert.equal(advanced.delivered.length,4);assert.equal(advanced.delivered.find(d=>d.index===index).at,marked.at);
+  assert.equal((await request(partPath,{action:'advance',part:1},driver)).status,409);
+  assert.equal((await request(partPath,{...check,checked:false},driver)).status,409);
+  const last=(await request(partPath,{action:'advance',part:2},driver)).data;assert.equal(last.part.number,3);assert.equal(last.delivered.length,8);assert.equal(last.navigation[0].returnsHome,true);
+  assert.equal((await request(partPath,{action:'finish'},driver)).data.status,'done');
   // A simultaneous burst reserves at most the configured 20 routes per minute.
   clock+=60000;let executions=0;
   const burst=await Promise.allSettled(Array.from({length:30},(_,i)=>service.budget.call('routes','burst-'+i,{i},async()=>{executions++;return {ok:true};})));
