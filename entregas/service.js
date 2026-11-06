@@ -10,7 +10,7 @@ const json = value => typeof value === 'string' ? JSON.parse(value) : value;
 const fail = (status, message) => { const e = new Error(message); e.status = status; throw e; };
 const text = (s, max = 300) => String(s ?? '').trim().slice(0, max);
 const terminal = o => ['done', 'cancelled'].includes(o.status);
-function createService({ openDb, fetchImpl = fetch, now = Date.now, monitorProvider, seedFile = path.join(__dirname, 'accounts.local.json') }) {
+function createService({ openDb, fetchImpl, now = Date.now, monitorProvider, seedFile = path.join(__dirname, 'accounts.local.json') }) {
   let initPromise;
   let timer, lastMaintenance=0;
   const listeners=new Set();

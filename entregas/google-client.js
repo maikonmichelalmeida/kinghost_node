@@ -3,14 +3,28 @@ const { waypoint, navigation, validateOrder } = require("./google-navigation");
 const D = require("./domain");
 const failure = (message, status = 502) =>
   Object.assign(new Error(message), { status });
-function createGoogle({ budget, fetchImpl = fetch }) {
+// KingHost also has IPv6. Use the single IPv4 address allowed on the Maps keys.
+function fetchMaps(url, { method = "GET", headers, body, signal }) {
+  return new Promise((resolve, reject) => {
+    const req = require("node:https").request(url, {method, headers, signal, family: 4}, res => {
+      const chunks = [];
+      res.on("data", chunk => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => resolve(new Response(Buffer.concat(chunks), {status: res.statusCode})));
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+function createGoogle({ budget, fetchImpl = fetchMaps }) {
   async function request(sku, id, input, url, options, keyName) {
     const key = process.env[keyName];
     if (!key)
       throw failure("Google Maps ainda não configurado no servidor.", 503);
     return budget.call(sku, id, input, async () => {
       try {
-        const headers = { ...options.headers, "X-Goog-Api-Key": key };
+        const headers = { ...options.headers };
+        if (sku !== "geocode") headers["X-Goog-Api-Key"] = key;
         const response = await fetchImpl(url, {
           ...options,
           headers,
@@ -126,6 +140,9 @@ function createGoogle({ budget, fetchImpl = fetch }) {
       {},
       "GOOGLE_GEOCODING_API_KEY",
     );
+    if (["REQUEST_DENIED", "OVER_DAILY_LIMIT", "OVER_QUERY_LIMIT", "UNKNOWN_ERROR"].includes(r.status)) {
+      throw failure("Confirmação pelo Google indisponível. Use endereço escrito e preço manual.", 503);
+    }
     const p = r.results?.[0];
     if (r.status !== "OK" || !p || p.partial_match)
       throw failure(
